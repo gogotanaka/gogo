@@ -1,0 +1,33 @@
+{
+  "cdcd8f472ea957ed9aea74fe8a4842498c9397a73dcd52a8d23f0b1f85f9567e": {
+    "deviceId": "cdcd8f472ea957ed9aea74fe8a4842498c9397a73dcd52a8d23f0b1f85f9567e",
+    "publicKey": "0L4bJvUcVBy0Q36Ai5BAi-fmdM3iFP7GIkT_CIztEtM",
+    "platform": "MacIntel",
+    "clientId": "openclaw-control-ui",
+    "clientMode": "webchat",
+    "role": "operator",
+    "roles": [
+      "operator"
+    ],
+    "scopes": [
+      "operator.admin",
+      "operator.approvals",
+      "operator.pairing"
+    ],
+    "tokens": {
+      "operator": {
+        "token": "0BuVPb86Ung7WGEPFdtbmmsdktWwKg1YoFdH2VsiPmk",
+        "role": "operator",
+        "scopes": [
+          "operator.admin",
+          "operator.approvals",
+          "operator.pairing"
+        ],
+        "createdAtMs": 1771663401950,
+        "lastUsedAtMs": 1771663411085
+      }
+    },
+    "createdAtMs": 1771663401950,
+    "approvedAtMs": 1771663401950
+  }
+}
