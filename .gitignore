@@ -1,3 +1,9 @@
 node_modules/
 .openclaw/logs
 .openclaw/agents/main/sessions
+.openclaw/openclaw.json.bak
+.openclaw/openclaw.json.bak.1
+.openclaw/openclaw.json.bak.2
+.DS_Store
+
+.openclaw/openclaw.json
