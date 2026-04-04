@@ -1,0 +1,14 @@
+{
+  "name": "slack-archiver",
+  "version": "1.0.0",
+  "description": "Slack全チャンネルメッセージをSQLite3に保存するアーカイバー",
+  "main": "sync.js",
+  "scripts": {
+    "sync": "node sync.js",
+    "sync:channel": "node sync.js --channel"
+  },
+  "dependencies": {
+    "better-sqlite3": "^11.0.0",
+    "dotenv": "^16.0.0"
+  }
+}

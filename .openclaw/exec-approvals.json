@@ -1,0 +1,9 @@
+{
+  "version": 1,
+  "socket": {
+    "path": "/Users/gogo/work/gogo/.openclaw/exec-approvals.sock",
+    "token": "twsiGRbpUp6JTUheWmGQhQc5yfV_ggOT"
+  },
+  "defaults": {},
+  "agents": {}
+}

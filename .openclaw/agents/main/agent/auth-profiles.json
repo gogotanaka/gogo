@@ -4,7 +4,7 @@
     "anthropic:default": {
       "type": "token",
       "provider": "anthropic",
-      "token": "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"
+      "token": "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"
     }
   },
   "lastGood": {
@@ -12,9 +12,9 @@
   },
   "usageStats": {
     "anthropic:default": {
-      "lastUsed": 1771730173522,
+      "lastUsed": 1775259590215,
       "errorCount": 0,
-      "lastFailureAt": 1771729992892
+      "lastFailureAt": 1772889971396
     }
   }
 }

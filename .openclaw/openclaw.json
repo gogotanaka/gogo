@@ -1,0 +1,102 @@
+{
+  "meta": {
+    "lastTouchedVersion": "2026.2.21-2",
+    "lastTouchedAt": "2026-03-05T01:14:45.105Z"
+  },
+  "wizard": {
+    "lastRunAt": "2026-03-05T01:14:45.078Z",
+    "lastRunVersion": "2026.2.21-2",
+    "lastRunCommand": "configure",
+    "lastRunMode": "local"
+  },
+  "browser": {
+    "profiles": {
+      "my-chrome": {
+        "cdpUrl": "http://127.0.0.1:18792",
+        "driver": "extension",
+        "color": "#00AA00"
+      }
+    }
+  },
+  "auth": {
+    "profiles": {
+      "anthropic:default": {
+        "provider": "anthropic",
+        "mode": "token"
+      }
+    }
+  },
+  "agents": {
+    "defaults": {
+      "model": {
+        "primary": "anthropic/claude-sonnet-4-6"
+      },
+      "models": {
+        "anthropic/claude-sonnet-4-6": {}
+      },
+      "workspace": "/Users/gogo/work/gogo/.openclaw/workspace",
+      "contextPruning": {
+        "mode": "cache-ttl",
+        "ttl": "1h"
+      },
+      "compaction": {
+        "mode": "safeguard"
+      },
+      "heartbeat": {
+        "every": "1h"
+      },
+      "maxConcurrent": 4
+    }
+  },
+  "commands": {
+    "native": "auto",
+    "nativeSkills": "auto",
+    "restart": true,
+    "ownerDisplay": "raw"
+  },
+  "channels": {
+    "slack": {
+      "mode": "socket",
+      "webhookPath": "/slack/events",
+      "enabled": true,
+      "botToken": "your-slack-bot-token-here",
+      "appToken": "your-slack-app-token-here",
+      "userTokenReadOnly": true,
+      "groupPolicy": "open",
+      "allowFrom": [
+        "*"
+      ],
+      "ackReaction": "eyes"
+    }
+  },
+  "gateway": {
+    "port": 18789,
+    "mode": "local",
+    "bind": "loopback",
+    "auth": {
+      "mode": "token",
+      "token": "4f9cf46b9d968fc75be3340cc918a1a604024c28cb3a7edd"
+    },
+    "tailscale": {
+      "mode": "off",
+      "resetOnExit": false
+    },
+    "nodes": {
+      "denyCommands": [
+        "camera.snap",
+        "camera.clip",
+        "screen.record",
+        "calendar.add",
+        "contacts.add",
+        "reminders.add"
+      ]
+    }
+  },
+  "plugins": {
+    "entries": {
+      "slack": {
+        "enabled": true
+      }
+    }
+  }
+}

@@ -1,9 +1,15 @@
 node_modules/
 .openclaw/logs
 .openclaw/agents/main/sessions
+.DS_Store
+
 .openclaw/openclaw.json.bak
 .openclaw/openclaw.json.bak.1
 .openclaw/openclaw.json.bak.2
-.DS_Store
 
-.openclaw/openclaw.json
+.openclaw/media/browser
+.openclaw/browser/openclaw/
+
+.openclaw/media/inbound
+
+.openclaw/workspace/skills/slack-archiver/messages.db
