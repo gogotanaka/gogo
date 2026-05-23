@@ -352,9 +352,8 @@ class Handler(BaseHTTPRequestHandler):
         try:
             notion_text = fetch_notion_text(force=force)
         except Exception as e:
-            body = f"<pre>Notion error: {html_lib.escape(str(e))}</pre>".encode("utf-8")
-            self._respond(500, "text/html; charset=utf-8", body)
-            return
+            print(f"  (Notion unavailable: {e})", file=sys.stderr)
+            notion_text = ""
         later_items, later_error = fetch_later_items(force=force)
         categorized = parse_notion(notion_text)
         html = generate_html(categorized, later_items, later_error, show_all)
@@ -372,7 +371,10 @@ class Handler(BaseHTTPRequestHandler):
 
 def main():
     print("Fetching Notion MAIN...", file=sys.stderr)
-    fetch_notion_text(force=True)
+    try:
+        fetch_notion_text(force=True)
+    except Exception as e:
+        print(f"  (Notion unavailable: {e})", file=sys.stderr)
     print("Fetching Slack Later...", file=sys.stderr)
     items, err = fetch_later_items(force=True)
     if err:
