@@ -2,8 +2,8 @@
 """Send a Slack message (stdin) for mf-pl.
 
 優先順:
-1. Bot トークン (~/.config/slack/mf_pl_bot_token または SLACK_BOT_TOKEN) —
-   投稿先は MF_PL_CHANNEL または ~/.config/slack/mf_pl_channel
+1. Bot トークン (config/slack_bot_token または SLACK_BOT_TOKEN) —
+   投稿先は MF_PL_CHANNEL または config/slack_channel
 2. CDP (localhost:9222) 経由の xoxc/xoxd — 自分への DM。
    Slack が CDP 付きで起動していない場合はエラーにするだけで、再起動はしない。
 """
@@ -14,8 +14,9 @@ import urllib.parse
 import urllib.request
 
 TEAM_ID = "T08KK9UCW"  # CDP フォールバックで使う aisaac workspace
-BOT_TOKEN_PATH = os.path.expanduser("~/.config/slack/mf_pl_bot_token")
-CHANNEL_PATH = os.path.expanduser("~/.config/slack/mf_pl_channel")
+CONF_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config")
+BOT_TOKEN_PATH = os.path.join(CONF_DIR, "slack_bot_token")
+CHANNEL_PATH = os.path.join(CONF_DIR, "slack_channel")
 
 
 def read_file(path):

@@ -25,15 +25,19 @@ Money Forward クラウド会計 API v3 の残高試算表から対象月のPL�
 
 売上サマリーは `sales.py` が生成（売上高の大きい順 + 合計行）。
 
-## 設定ファイル
+## 設定ファイル（`config/` 配下、.gitignore 済み）
 
 | パス | 内容 |
 |---|---|
-| `~/.config/moneyforward/oauth_client.json` | 共通の Client ID/Secret（`{"client_id","client_secret"}`） |
-| `~/.config/moneyforward/oauth_client-<profile>.json` | 会社別クライアント（あれば共通より優先） |
-| `~/.config/moneyforward/tokens.db` | トークン (SQLite)。`tokens` テーブルにプロファイル別で保存、auth.py が管理 |
-| `~/.config/slack/mf_pl_bot_token` | Slack bot トークン（xoxb-…、awsm workspace） |
-| `~/.config/slack/mf_pl_channel` | 投稿先チャンネルID（環境変数 MF_PL_CHANNEL が優先） |
+| `config/oauth_client.json` | 共通の Client ID/Secret（`{"client_id","client_secret"}`） |
+| `config/oauth_client-<profile>.json` | 会社別クライアント（あれば共通より優先） |
+| `config/tokens.db` | トークン (SQLite)。`tokens` テーブルにプロファイル別で保存、auth.py が管理 |
+| `config/slack_bot_token` | Slack bot トークン（xoxb-…、awsm workspace、scope: chat:write + files:write） |
+| `config/slack_channel` | 投稿先チャンネルID（環境変数 MF_PL_CHANNEL が優先） |
+| `config/api_key` | MF APIキー（会計APIには使えないため未使用。連結会計用） |
+
+`config/` は認証情報のみのディレクトリで、リポジトリにはコミットしない。
+バックアップ・別マシン移行時はこのディレクトリごとコピーすればよい。
 
 ## 会社を追加するには
 

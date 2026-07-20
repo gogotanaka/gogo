@@ -8,7 +8,7 @@
 #   ./run.sh --profile aisaac      # (--full 時) 1社だけ
 #   ./run.sh --dry-run             # 送信せずメッセージを表示
 #
-# 投稿先: ~/.config/slack/mf_pl_channel（または MF_PL_CHANNEL）
+# 投稿先: config/slack_channel（または MF_PL_CHANNEL）
 set -euo pipefail
 
 DIR="$(cd "$(dirname "$0")" && pwd)"

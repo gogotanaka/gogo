@@ -5,11 +5,11 @@
 複数の会社（事業者）に対応するため、トークンはプロファイル別に保存する。
 
 - 初回（会社ごと）: `python3 auth.py <profile>` — ブラウザの認可画面で対象の会社を
-  選んで同意 → ~/.config/moneyforward/tokens.db (SQLite) の tokens テーブルに保存
+  選んで同意 → config/tokens.db (SQLite) の tokens テーブルに保存
 - 以降: get_access_token(profile) がリフレッシュトークン（540日有効）で自動更新
 
-クライアント設定は共通の ~/.config/moneyforward/oauth_client.json を使う。
-会社が別テナントで別アプリ登録が必要な場合は oauth_client-<profile>.json が優先される。
+クライアント設定は共通の config/oauth_client.json を使う。
+会社が別テナントで別アプリ登録が必要な場合は config/oauth_client-<profile>.json が優先される。
   {"client_id": "...", "client_secret": "...", "redirect_uri": "http://localhost:8384/callback"}
 """
 import base64
@@ -28,7 +28,8 @@ import webbrowser
 
 AUTH_BASE = "https://api.biz.moneyforward.com"
 SCOPE = "mfc/accounting/report.read mfc/accounting/offices.read"
-CONF_DIR = os.path.expanduser("~/.config/moneyforward")
+# 認証情報・トークンDBはアプリ配下の config/ に集約（.gitignore 済み）
+CONF_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config")
 DEFAULT_REDIRECT = "http://localhost:8384/callback"
 
 
