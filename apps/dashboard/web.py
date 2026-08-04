@@ -14,6 +14,7 @@ import threading
 import time
 import webbrowser
 from datetime import datetime
+import socketserver
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
@@ -21,6 +22,48 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import fetch_counts  # noqa: E402
 
 PORT = 8380
+CACHE_FILE = Path(__file__).resolve().parent / "slack_cache.json"
+CACHE_TTL = 600  # 10 minutes
+
+
+def _load_cache():
+    try:
+        if not CACHE_FILE.exists():
+            return None, None
+        if time.time() - CACHE_FILE.stat().st_mtime > CACHE_TTL:
+            return None, None
+        data = json.loads(CACHE_FILE.read_text(encoding="utf-8"))
+        return data["rows"], data["fetched_at"]
+    except Exception:
+        return None, None
+
+
+def _save_cache(rows):
+    fetched_at = time.time()
+    CACHE_FILE.write_text(
+        json.dumps({"fetched_at": fetched_at, "rows": rows},
+                   ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    return fetched_at
+
+
+_fetch_lock = threading.Lock()
+
+
+def get_rows():
+    """Return (rows, fetched_at, from_cache). Thread-safe."""
+    rows, fetched_at = _load_cache()
+    if rows is not None:
+        return rows, fetched_at, True
+    with _fetch_lock:
+        # Re-check after acquiring lock — another thread may have just fetched.
+        rows, fetched_at = _load_cache()
+        if rows is not None:
+            return rows, fetched_at, True
+        rows = fetch_counts.collect()
+        fetched_at = _save_cache(rows)
+    return rows, fetched_at, False
 
 
 PAGE = """<!doctype html>
@@ -95,9 +138,10 @@ PAGE = """<!doctype html>
 <body>
   <h1>Slack dashboard</h1>
   <div class="meta">
-    fetched at {ts} &nbsp;·&nbsp; {n} workspace(s) &nbsp;·&nbsp;
+    fetched at {ts}{cache_badge} &nbsp;·&nbsp; {n} workspace(s) &nbsp;·&nbsp;
     <span class="clearcount">{clear}</span> &nbsp;·&nbsp;
     <button onclick="location.reload()">reload</button>
+    &nbsp;<button onclick="location.href='/refresh'">&#8635; force sync</button>
   </div>
   <div class="cols">
     <div class="col-left">
@@ -246,7 +290,7 @@ def render_mentions(rows):
     return "\n".join(blocks)
 
 
-def render(rows):
+def render(rows, fetched_at=None, from_cache=False):
     clear_n = 0
     if not rows:
         body = '<tr><td colspan="5">No workspaces found in localConfig_v2.</td></tr>'
@@ -311,8 +355,22 @@ def render(rows):
         else:
             clear_label = f"0 / {len(rows)} clear — 頑張ろう"
         mentions_html = render_mentions(rows)
+    if fetched_at:
+        ts_str = datetime.fromtimestamp(fetched_at).strftime("%Y-%m-%d %H:%M:%S")
+    else:
+        ts_str = time.strftime("%Y-%m-%d %H:%M:%S")
+    if from_cache:
+        age_s = int(time.time() - fetched_at)
+        cache_badge = (f' &nbsp;<span style="background:#f0f9ff;color:#0369a1;'
+                       f'font-size:11px;padding:1px 8px;border-radius:10px;'
+                       f'border:1px solid #bae6fd">cached {age_s}s ago</span>')
+    else:
+        cache_badge = (f' &nbsp;<span style="background:#f0fdf4;color:#15803d;'
+                       f'font-size:11px;padding:1px 8px;border-radius:10px;'
+                       f'border:1px solid #bbf7d0">live</span>')
     return PAGE.format(
-        ts=time.strftime("%Y-%m-%d %H:%M:%S"),
+        ts=ts_str,
+        cache_badge=cache_badge,
         n=len(rows),
         clear=html.escape(clear_label),
         rows=body,
@@ -327,8 +385,23 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path in ("/", "/index.html"):
             try:
-                rows = fetch_counts.collect()
-                page = render(rows)
+                rows, fetched_at, from_cache = get_rows()
+                page = render(rows, fetched_at, from_cache)
+            except Exception as e:
+                page = (f"<!doctype html><body><h1>error</h1>"
+                        f"<pre>{html.escape(str(e))}</pre></body>")
+            data = page.encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+        elif self.path == "/refresh":
+            try:
+                if CACHE_FILE.exists():
+                    CACHE_FILE.unlink()
+                rows, fetched_at, from_cache = get_rows()
+                page = render(rows, fetched_at, from_cache)
             except Exception as e:
                 page = (f"<!doctype html><body><h1>error</h1>"
                         f"<pre>{html.escape(str(e))}</pre></body>")
@@ -340,8 +413,11 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.write(data)
         elif self.path == "/api/counts.json":
             try:
-                rows = fetch_counts.collect()
-                data = json.dumps(rows, ensure_ascii=False).encode("utf-8")
+                rows, fetched_at, from_cache = get_rows()
+                data = json.dumps(
+                    {"fetched_at": fetched_at, "from_cache": from_cache, "rows": rows},
+                    ensure_ascii=False,
+                ).encode("utf-8")
                 code = 200
             except Exception as e:
                 data = json.dumps({"error": str(e)}).encode("utf-8")
@@ -356,8 +432,12 @@ class Handler(BaseHTTPRequestHandler):
             self.end_headers()
 
 
+class ThreadingHTTPServer(socketserver.ThreadingMixIn, HTTPServer):
+    daemon_threads = True
+
+
 def main():
-    server = HTTPServer(("127.0.0.1", PORT), Handler)
+    server = ThreadingHTTPServer(("127.0.0.1", PORT), Handler)
     url = f"http://localhost:{PORT}"
     print(f"[dashboard] listening on {url}", file=sys.stderr)
     threading.Timer(0.4, lambda: webbrowser.open(url)).start()
