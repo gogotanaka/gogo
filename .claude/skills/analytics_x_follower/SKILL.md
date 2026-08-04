@@ -1,13 +1,17 @@
 ---
 name: analytics_x_follower
-description: 普段使いのGoogle ChromeをAppleScript経由で操作してX(Twitter)のフォロワー一覧を取得・分析する。DOMから@handle/名前/bio/verifiedを収集し、bioキーワードでカテゴリ分け(エンジニア/起業/AI/PM/マーケ/デザイン/VC等)してレポート。「Xのフォロワー分析して」「@xxxのフォロワー一覧出して」「直近100人のフォロワー見て」等のリクエストで使う。
+description: 普段使いのGoogle ChromeをAppleScript経由で操作してX(Twitter)のフォロワー一覧を取得・分析する。DOMから@handle/名前/bio/verifiedを収集→各プロフィールを巡回してfollowers_count/following_count/i_follow/直近投稿/protectedをSQLiteに保存→SQLで分析。「Xのフォロワー分析して」「@xxxのフォロワー一覧出して」「直近100人のフォロワー見て」「DBに保存して」等のリクエストで使う。
 ---
 
 # analytics_x_follower
 
-普段使いの Google Chrome（既にXにログインしているプロファイル）をそのまま使い、AppleScript で `https://x.com/<user>/followers` を開いて DOM からフォロワー情報を抽出する。
+普段使いの Google Chrome（既にXにログインしているプロファイル）をそのまま使い、AppleScript で X プロフィール DOM から情報を抽出する。
 
-**重要な制約**: 2026年時点のXは React fiber を DOM に attach しなくなり、`window.fetch` / `XMLHttpRequest` を後から hook しても捕捉できない（X側が初期化時に originalFetch をクロージャに抱え込むため）。したがって **follower_count はこの方式では取れない**。取れるのは `@screen_name` / `display_name` / `bio` / `verified` のみ。フィルタは bio キーワードと verified のみで行う。
+**2段アーキテクチャ**:
+1. `followers` ページからフォロワー一覧（screen_name / name / bio / verified）を DOM 抽出 → JSON
+2. 各プロフィールページを巡回して `followers_count` / `following_count` / `i_follow`（自分がフォロー中か）/ `location` / `joined` / `website` / `protected`（鍵アカ）/ 直近の投稿 を抽出 → **SQLite**
+
+`followers` ページ単体からは follower_count / following_count は取れない（X は React fiber を DOM に attach せず、後付け fetch hook も塞いでいる）。プロフィール巡回経路では DOM の `a[href$="/verified_followers"]` / `a[href$="/following"]` の innerText から取得し、鍵アカは primaryColumn テキストの正規表現フォールバックで拾う。
 
 ## 前提
 
@@ -17,43 +21,98 @@ description: 普段使いのGoogle ChromeをAppleScript経由で操作してX(Tw
 3. 普通の Python3 が `osascript` を呼べる環境（macOS）。
 4. CDP は使わない（Slack desktop が 9222 を専有しているのと、ログインを引き継ぐためにユーザープロファイルの再起動はしたくない）。
 
-## 使い方
-
-3ステップ:
+## 使い方（推奨: DB経路）
 
 ```bash
-# 1. フォロワーDOM収集 (1〜2分)
-python3 .../scripts/run.py gogo_tanaka --no-it     # 全件収集 (439人前後)
+# 1. フォロワー一覧収集 (1〜2分) → JSON
+python3 .../scripts/run.py gogo_tanaka --no-it       # 全件 (439人前後)
 
-# 2. follower_count をエンリッチ (各プロフィールを巡回, 1件約2秒)
+# 2. 各プロフィールを巡回して full データを SQLite に保存 (約5秒/人 → 全439人で35〜40分)
+python3 .../scripts/collect_profile_to_db.py /tmp/x_followers_gogo_tanaka.json --skip-existing
+
+# 3. SQL で分析
+sqlite3 /tmp/x_followers_gogo_tanaka.db "SELECT screen_name, name, followers_count FROM profiles WHERE i_follow=1 ORDER BY followers_count DESC LIMIT 20;"
+```
+
+`--skip-existing` は DB に既に follower_count が入っているユーザーを飛ばすので、中断→再開や差分実行に使える。
+
+## 出力先
+
+| 用途 | パス |
+|---|---|
+| フォロワー一覧 JSON | `/tmp/x_followers_<user>.json` (`--out` で変更可) |
+| プロフィール+投稿 DB | `/tmp/x_followers_<user>.db` (`--db` で変更可) |
+
+`/tmp` は macOS の再起動で消える点に注意。永続化したい場合は `--db ~/.local/share/x_analytics/<user>.db` 等を指定。
+
+## DB スキーマ
+
+```sql
+CREATE TABLE profiles (
+  screen_name      TEXT PRIMARY KEY,
+  name             TEXT,
+  description      TEXT,           -- bio
+  verified         INTEGER,        -- 0/1
+  protected        INTEGER,        -- 0/1 (鍵アカ)
+  followers_count  INTEGER,        -- 鍵アカでもテキスト fallback で取れる
+  following_count  INTEGER,
+  i_follow         INTEGER,        -- 0/1/NULL: 自分がフォロー中か
+  location         TEXT,
+  joined           TEXT,           -- "2019年4月からXを利用しています" など
+  website          TEXT,
+  url              TEXT,           -- https://x.com/<screen_name>
+  collected_at     TEXT            -- ISO datetime
+);
+CREATE TABLE posts (
+  screen_name TEXT,
+  post_id     TEXT,                -- status id
+  text        TEXT,
+  posted_at   TEXT,                -- ISO datetime (time[datetime])
+  url         TEXT,                -- https://x.com/<sn>/status/<id>
+  PRIMARY KEY (screen_name, post_id)
+);
+```
+
+UPSERT で更新されるので再実行は安全。
+
+## 旧経路 (JSON のみ)
+
+```bash
+# follower_count だけ JSON にマージしたい時 (DB 不要・軽量)
 python3 .../scripts/enrich_followers.py /tmp/x_followers_gogo_tanaka.json --skip-with-count
-# 全439件で約15分。--limit N で部分エンリッチも可。
 
-# 3. フィルタしてレポート
-python3 .../scripts/filter_report.py /tmp/x_followers_gogo_tanaka.json --min-followers 300
+# bio キーワードでフィルタしてレポート
 python3 .../scripts/filter_report.py /tmp/x_followers_gogo_tanaka.json --min-followers 1000 --category founder
-python3 .../scripts/filter_report.py /tmp/x_followers_gogo_tanaka.json --category engineer --top 30
 ```
 
-`run.py` の直接フィルタ機能（旧仕様の `--min-followers`）は follower_count が無いため動きません。エンリッチ→フィルタの2段構えに統一しています。
+## よく使う SQL レシピ
 
-例:
+```sql
+-- 相互フォローのうちフォロワー多い順
+SELECT screen_name, name, followers_count FROM profiles WHERE i_follow=1 ORDER BY followers_count DESC LIMIT 30;
 
-```bash
-# gogo_tanaka のフォロワーを、フォロワー300以上 or IT系で抽出（既定）
-python3 .../run.py gogo_tanaka
+-- 自分がフォローしてないけど follower 1000+ かつ bio に AI/founder
+SELECT screen_name, name, followers_count, substr(description,1,60)
+FROM profiles
+WHERE (i_follow IS NULL OR i_follow=0)
+  AND followers_count >= 1000
+  AND (description LIKE '%AI%' OR description LIKE '%founder%' OR description LIKE '%起業%')
+ORDER BY followers_count DESC;
 
-# 直近100人のフォロワーから抽出、しきい値500
-python3 .../run.py gogo_tanaka --min-followers 500 --limit 100
+-- 最近 AI 系投稿をしているフォロワー
+SELECT p.screen_name, profiles.name, p.posted_at, substr(p.text,1,80)
+FROM posts p JOIN profiles ON p.screen_name=profiles.screen_name
+WHERE p.text LIKE '%AI%' OR p.text LIKE '%LLM%'
+ORDER BY p.posted_at DESC LIMIT 50;
 
-# フォロワー数だけで判定（IT系判定なし）
-python3 .../run.py gogo_tanaka --no-it
-
-# 全収集ユーザー中フォロワー上位50人もレポート末尾に追加
-python3 .../run.py gogo_tanaka --top-all 50
+-- フォロワー数分布
+SELECT CASE
+  WHEN followers_count<100 THEN '<100'
+  WHEN followers_count<1000 THEN '100-999'
+  WHEN followers_count<10000 THEN '1k-10k'
+  ELSE '10k+' END AS bucket, count(*)
+FROM profiles GROUP BY bucket;
 ```
-
-結果は標準出力に Markdown 風に整形、生 JSON は `--out`（既定 `/tmp/x_followers_<user>.json`）に保存。
 
 ## パラメータ
 
