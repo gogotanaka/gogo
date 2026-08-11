@@ -12,12 +12,18 @@
 python3 apps/dashboard/web.py
 ```
 
-ブラウザは自動で開く。リロードで再 fetch。
+ブラウザは自動で開く。結果は `slack_cache.json` に 10 分キャッシュされ、
+リロードはキャッシュ内なら即表示(`cached Ns ago` バッジ)。画面の
+「↻ force sync」ボタン(= `POST /refresh`)でキャッシュを無視して再 fetch。
+
+`/api/counts.json` は `{"fetched_at": ..., "from_cache": ..., "rows": [...]}`
+を返す(rows が従来の配列)。
 
 ## ファイル
 
 - `fetch_counts.py` — 各 workspace の3つの count を並列取得、JSON 出力もできる (`python3 fetch_counts.py`)
 - `web.py` — port 8380 の HTTP サーバー
+- `slack_cache.json` — fetch 結果のキャッシュ(gitignore 済み、消しても良い)
 
 ## 内部 API メモ
 
