@@ -179,6 +179,7 @@ LATER_CLEAR_THRESHOLD = {
     "a2zltd": 10,
     "xtoon": 10,
     "sushiconsulting": 10,
+    "awsm-inc": 10,
 }
 DEFAULT_LATER_CLEAR_THRESHOLD = 3
 
