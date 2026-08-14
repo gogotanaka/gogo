@@ -342,9 +342,10 @@ def count_drafts(xoxc, xoxd):
       - paging is *not* via response_metadata.next_cursor; pass
         `next_ts=<last item's last_updated_ts>` to fetch the next page
       - keep going while has_more is True
-      - drafts whose destination channel is archived ARE returned by the
-        API but the sidebar hides them. Drop drafts whose every
-        destination channel is_archived=True.
+      - drafts whose destination channel is archived or deleted
+        (conversations.info -> channel_not_found) ARE returned by the API
+        but the sidebar hides them. Drop drafts whose every destination
+        channel is archived or gone.
     """
     method = "drafts.list"
     actives = []
@@ -367,33 +368,36 @@ def count_drafts(xoxc, xoxd):
         if not next_ts:
             break
 
-    # Discover archived destination channels (only need to call
-    # conversations.info for each unique cid once).
+    # Discover hidden destination channels — archived or deleted
+    # (channel_not_found) — with one conversations.info call per unique cid.
     dest_cids = {x.get("channel_id")
                  for d in actives
                  for x in (d.get("destinations") or [])
                  if x.get("channel_id")}
-    archived = set()
+    hidden = set()
     if dest_cids:
-        def _is_archived(cid):
+        def _is_hidden(cid):
             try:
                 r = api("conversations.info", {"channel": cid},
                         xoxc, xoxd, form=True)
-                if r.get("ok") and r.get("channel", {}).get("is_archived"):
+                if r.get("ok"):
+                    if r.get("channel", {}).get("is_archived"):
+                        return cid
+                elif r.get("error") == "channel_not_found":
                     return cid
             except Exception:
                 pass
             return None
         with ThreadPoolExecutor(max_workers=8) as ex:
-            for cid in ex.map(_is_archived, list(dest_cids)):
+            for cid in ex.map(_is_hidden, list(dest_cids)):
                 if cid:
-                    archived.add(cid)
+                    hidden.add(cid)
 
     def is_visible(d):
         dests = d.get("destinations") or []
         if not dests:
             return True
-        return any(x.get("channel_id") not in archived for x in dests)
+        return any(x.get("channel_id") not in hidden for x in dests)
 
     return sum(1 for d in actives if is_visible(d)), method
 

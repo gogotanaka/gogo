@@ -174,6 +174,7 @@ PAGE = """<!doctype html>
 # the workspace `domain` field from localConfig_v2.teams.
 LATER_CLEAR_THRESHOLD = {
     "aisaac": 10,
+    "awsm-inc": 10,
     "entm-inc": 10,
     "riseltd": 10,
     "a2zltd": 10,
