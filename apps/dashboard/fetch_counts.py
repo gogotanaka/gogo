@@ -346,6 +346,9 @@ def count_drafts(xoxc, xoxd):
         (conversations.info -> channel_not_found) ARE returned by the API
         but the sidebar hides them. Drop drafts whose every destination
         channel is archived or gone.
+      - thread drafts whose parent thread is gone (root message deleted;
+        conversations.replies -> thread_not_found) are also returned but
+        hidden by the sidebar. Drop those too.
     """
     method = "drafts.list"
     actives = []
@@ -393,11 +396,49 @@ def count_drafts(xoxc, xoxd):
                 if cid:
                     hidden.add(cid)
 
+    # Thread drafts whose parent thread no longer exists (root message
+    # deleted) are hidden by the sidebar too. Verify each unique
+    # (channel, thread_ts) destination with conversations.replies; only a
+    # definitive thread_not_found/message_not_found marks it dead —
+    # transient errors leave the draft visible (never undercount).
+    thread_keys = {(x.get("channel_id"), x.get("thread_ts"))
+                   for d in actives
+                   for x in (d.get("destinations") or [])
+                   if x.get("channel_id") and x.get("thread_ts")
+                   and x.get("channel_id") not in hidden}
+    dead_threads = set()
+    if thread_keys:
+        def _is_dead(key):
+            cid, ts = key
+            try:
+                r = api("conversations.replies",
+                        {"channel": cid, "ts": ts, "limit": 1},
+                        xoxc, xoxd, form=True)
+                if not r.get("ok") and r.get("error") in (
+                        "thread_not_found", "message_not_found"):
+                    return key
+            except Exception:
+                pass
+            return None
+        with ThreadPoolExecutor(max_workers=8) as ex:
+            for key in ex.map(_is_dead, list(thread_keys)):
+                if key:
+                    dead_threads.add(key)
+
+    def dest_visible(x):
+        cid = x.get("channel_id")
+        if cid in hidden:
+            return False
+        ts = x.get("thread_ts")
+        if ts and (cid, ts) in dead_threads:
+            return False
+        return True
+
     def is_visible(d):
         dests = d.get("destinations") or []
         if not dests:
             return True
-        return any(x.get("channel_id") not in hidden for x in dests)
+        return any(dest_visible(x) for x in dests)
 
     return sum(1 for d in actives if is_visible(d)), method
 
