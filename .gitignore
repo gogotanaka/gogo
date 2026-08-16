@@ -13,3 +13,5 @@ node_modules/
 .openclaw/media/inbound
 
 .openclaw/workspace/skills/slack-archiver/messages.db
+
+apps/dashboard/slack_cache.json
