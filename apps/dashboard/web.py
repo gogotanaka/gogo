@@ -8,14 +8,14 @@ Listens on http://localhost:8380 and opens the browser on startup.
 """
 import html
 import json
+import os
 import re
 import sys
 import threading
 import time
 import webbrowser
 from datetime import datetime
-import socketserver
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -23,46 +23,69 @@ import fetch_counts  # noqa: E402
 
 PORT = 8380
 CACHE_FILE = Path(__file__).resolve().parent / "slack_cache.json"
+# NOTE: equal to the page's <meta http-equiv="refresh"> interval, so the
+# automatic reload always refetches live data; the cache only absorbs manual
+# reloads / extra tabs / API polls inside the window.
 CACHE_TTL = 600  # 10 minutes
 
 
 def _load_cache():
     try:
-        if not CACHE_FILE.exists():
-            return None, None
-        if time.time() - CACHE_FILE.stat().st_mtime > CACHE_TTL:
-            return None, None
         data = json.loads(CACHE_FILE.read_text(encoding="utf-8"))
-        return data["rows"], data["fetched_at"]
+        rows, fetched_at = data["rows"], data["fetched_at"]
+        if not isinstance(rows, list) or not isinstance(fetched_at, (int, float)):
+            return None, None
+        if not 0 <= time.time() - fetched_at <= CACHE_TTL:
+            return None, None
+        return rows, fetched_at
     except Exception:
         return None, None
 
 
 def _save_cache(rows):
+    """Best-effort: a cache-write failure must not discard a good fetch."""
     fetched_at = time.time()
-    CACHE_FILE.write_text(
-        json.dumps({"fetched_at": fetched_at, "rows": rows},
-                   ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
+    try:
+        tmp = CACHE_FILE.with_name(CACHE_FILE.name + ".tmp")
+        tmp.write_text(
+            json.dumps({"fetched_at": fetched_at, "rows": rows},
+                       ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        os.replace(tmp, CACHE_FILE)  # atomic: readers never see a torn file
+    except OSError as e:
+        sys.stderr.write(f"[dashboard] cache write failed: {e}\n")
     return fetched_at
 
 
 _fetch_lock = threading.Lock()
 
 
-def get_rows():
-    """Return (rows, fetched_at, from_cache). Thread-safe."""
-    rows, fetched_at = _load_cache()
-    if rows is not None:
-        return rows, fetched_at, True
-    with _fetch_lock:
-        # Re-check after acquiring lock — another thread may have just fetched.
+def get_rows(force=False):
+    """Return (rows, fetched_at, from_cache). Thread-safe.
+
+    force=True skips the cache and always fetches; the old cache file is
+    left in place until the new fetch succeeds, so a failed force-sync
+    doesn't destroy the last known good snapshot.
+    """
+    if not force:
         rows, fetched_at = _load_cache()
         if rows is not None:
             return rows, fetched_at, True
+    with _fetch_lock:
+        if not force:
+            # Re-check after acquiring lock — another thread may have just
+            # fetched.
+            rows, fetched_at = _load_cache()
+            if rows is not None:
+                return rows, fetched_at, True
         rows = fetch_counts.collect()
-        fetched_at = _save_cache(rows)
+        if rows and not all(r.get("error") for r in rows):
+            fetched_at = _save_cache(rows)
+        else:
+            # Don't pin an empty / all-failed snapshot for CACHE_TTL; the
+            # next plain reload should retry.
+            fetched_at = time.time()
     return rows, fetched_at, False
 
 
@@ -141,7 +164,9 @@ PAGE = """<!doctype html>
     fetched at {ts}{cache_badge} &nbsp;·&nbsp; {n} workspace(s) &nbsp;·&nbsp;
     <span class="clearcount">{clear}</span> &nbsp;·&nbsp;
     <button onclick="location.reload()">reload</button>
-    &nbsp;<button onclick="location.href='/refresh'">&#8635; force sync</button>
+    <form method="post" action="/refresh" style="display:inline">
+      <button>&#8635; force sync</button>
+    </form>
   </div>
   <div class="cols">
     <div class="col-left">
@@ -356,19 +381,16 @@ def render(rows, fetched_at=None, from_cache=False):
         else:
             clear_label = f"0 / {len(rows)} clear — 頑張ろう"
         mentions_html = render_mentions(rows)
-    if fetched_at:
-        ts_str = datetime.fromtimestamp(fetched_at).strftime("%Y-%m-%d %H:%M:%S")
-    else:
-        ts_str = time.strftime("%Y-%m-%d %H:%M:%S")
+    ts_str = datetime.fromtimestamp(
+        fetched_at or time.time()).strftime("%Y-%m-%d %H:%M:%S")
     if from_cache:
         age_s = int(time.time() - fetched_at)
-        cache_badge = (f' &nbsp;<span style="background:#f0f9ff;color:#0369a1;'
-                       f'font-size:11px;padding:1px 8px;border-radius:10px;'
-                       f'border:1px solid #bae6fd">cached {age_s}s ago</span>')
+        label, bg, fg, bd = f"cached {age_s}s ago", "#f0f9ff", "#0369a1", "#bae6fd"
     else:
-        cache_badge = (f' &nbsp;<span style="background:#f0fdf4;color:#15803d;'
-                       f'font-size:11px;padding:1px 8px;border-radius:10px;'
-                       f'border:1px solid #bbf7d0">live</span>')
+        label, bg, fg, bd = "live", "#f0fdf4", "#15803d", "#bbf7d0"
+    cache_badge = (f' &nbsp;<span style="background:{bg};color:{fg};'
+                   f'font-size:11px;padding:1px 8px;border-radius:10px;'
+                   f'border:1px solid {bd}">{label}</span>')
     return PAGE.format(
         ts=ts_str,
         cache_badge=cache_badge,
@@ -383,36 +405,56 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
         sys.stderr.write("[dashboard] " + (fmt % args) + "\n")
 
+    def _send(self, code, ctype, data):
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(data)))
+        # The body embeds its own freshness (live / cached Ns ago); a
+        # browser- or bfcache-replayed copy would lie about it.
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(data)
+
+    def _send_page(self):
+        try:
+            rows, fetched_at, from_cache = get_rows()
+            page = render(rows, fetched_at, from_cache)
+            code = 200
+        except Exception as e:
+            page = (f"<!doctype html><body><h1>error</h1>"
+                    f"<pre>{html.escape(str(e))}</pre></body>")
+            code = 500
+        self._send(code, "text/html; charset=utf-8", page.encode("utf-8"))
+
+    def _redirect_home(self):
+        self.send_response(303)
+        self.send_header("Location", "/")
+        self.end_headers()
+
+    def do_POST(self):
+        if self.path.split("?", 1)[0] == "/refresh":
+            try:
+                get_rows(force=True)
+            except Exception as e:
+                # Fall through to the redirect: "/" serves the error (or the
+                # still-intact last good cache) without parking the browser
+                # on the side-effecting /refresh URL.
+                sys.stderr.write(f"[dashboard] force sync failed: {e}\n")
+            self._redirect_home()
+        else:
+            self.send_response(404)
+            self.end_headers()
+
     def do_GET(self):
-        if self.path in ("/", "/index.html"):
-            try:
-                rows, fetched_at, from_cache = get_rows()
-                page = render(rows, fetched_at, from_cache)
-            except Exception as e:
-                page = (f"<!doctype html><body><h1>error</h1>"
-                        f"<pre>{html.escape(str(e))}</pre></body>")
-            data = page.encode("utf-8")
-            self.send_response(200)
-            self.send_header("Content-Type", "text/html; charset=utf-8")
-            self.send_header("Content-Length", str(len(data)))
-            self.end_headers()
-            self.wfile.write(data)
-        elif self.path == "/refresh":
-            try:
-                if CACHE_FILE.exists():
-                    CACHE_FILE.unlink()
-                rows, fetched_at, from_cache = get_rows()
-                page = render(rows, fetched_at, from_cache)
-            except Exception as e:
-                page = (f"<!doctype html><body><h1>error</h1>"
-                        f"<pre>{html.escape(str(e))}</pre></body>")
-            data = page.encode("utf-8")
-            self.send_response(200)
-            self.send_header("Content-Type", "text/html; charset=utf-8")
-            self.send_header("Content-Length", str(len(data)))
-            self.end_headers()
-            self.wfile.write(data)
-        elif self.path == "/api/counts.json":
+        path = self.path.split("?", 1)[0]
+        if path in ("/", "/index.html"):
+            self._send_page()
+        elif path == "/refresh":
+            # Force sync is POST-only (GETs can be issued speculatively by
+            # browsers/link previews and must stay side-effect-free); a
+            # stray GET here just goes home.
+            self._redirect_home()
+        elif path == "/api/counts.json":
             try:
                 rows, fetched_at, from_cache = get_rows()
                 data = json.dumps(
@@ -423,18 +465,10 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as e:
                 data = json.dumps({"error": str(e)}).encode("utf-8")
                 code = 500
-            self.send_response(code)
-            self.send_header("Content-Type", "application/json; charset=utf-8")
-            self.send_header("Content-Length", str(len(data)))
-            self.end_headers()
-            self.wfile.write(data)
+            self._send(code, "application/json; charset=utf-8", data)
         else:
             self.send_response(404)
             self.end_headers()
-
-
-class ThreadingHTTPServer(socketserver.ThreadingMixIn, HTTPServer):
-    daemon_threads = True
 
 
 def main():
@@ -446,6 +480,8 @@ def main():
         server.serve_forever()
     except KeyboardInterrupt:
         pass
+    finally:
+        server.server_close()
 
 
 if __name__ == "__main__":
