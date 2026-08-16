@@ -342,9 +342,13 @@ def count_drafts(xoxc, xoxd):
       - paging is *not* via response_metadata.next_cursor; pass
         `next_ts=<last item's last_updated_ts>` to fetch the next page
       - keep going while has_more is True
-      - drafts whose destination channel is archived ARE returned by the
-        API but the sidebar hides them. Drop drafts whose every
-        destination channel is_archived=True.
+      - drafts whose destination channel is archived or deleted
+        (conversations.info -> channel_not_found) ARE returned by the API
+        but the sidebar hides them. Drop drafts whose every destination
+        channel is archived or gone.
+      - thread drafts whose parent thread is gone (root message deleted;
+        conversations.replies -> thread_not_found) are also returned but
+        hidden by the sidebar. Drop those too.
     """
     method = "drafts.list"
     actives = []
@@ -367,33 +371,74 @@ def count_drafts(xoxc, xoxd):
         if not next_ts:
             break
 
-    # Discover archived destination channels (only need to call
-    # conversations.info for each unique cid once).
+    # Discover hidden destination channels — archived or deleted
+    # (channel_not_found) — with one conversations.info call per unique cid.
     dest_cids = {x.get("channel_id")
                  for d in actives
                  for x in (d.get("destinations") or [])
                  if x.get("channel_id")}
-    archived = set()
+    hidden = set()
     if dest_cids:
-        def _is_archived(cid):
+        def _is_hidden(cid):
             try:
                 r = api("conversations.info", {"channel": cid},
                         xoxc, xoxd, form=True)
-                if r.get("ok") and r.get("channel", {}).get("is_archived"):
+                if r.get("ok"):
+                    if r.get("channel", {}).get("is_archived"):
+                        return cid
+                elif r.get("error") == "channel_not_found":
                     return cid
             except Exception:
                 pass
             return None
         with ThreadPoolExecutor(max_workers=8) as ex:
-            for cid in ex.map(_is_archived, list(dest_cids)):
+            for cid in ex.map(_is_hidden, list(dest_cids)):
                 if cid:
-                    archived.add(cid)
+                    hidden.add(cid)
+
+    # Thread drafts whose parent thread no longer exists (root message
+    # deleted) are hidden by the sidebar too. Verify each unique
+    # (channel, thread_ts) destination with conversations.replies; only a
+    # definitive thread_not_found/message_not_found marks it dead —
+    # transient errors leave the draft visible (never undercount).
+    thread_keys = {(x.get("channel_id"), x.get("thread_ts"))
+                   for d in actives
+                   for x in (d.get("destinations") or [])
+                   if x.get("channel_id") and x.get("thread_ts")
+                   and x.get("channel_id") not in hidden}
+    dead_threads = set()
+    if thread_keys:
+        def _is_dead(key):
+            cid, ts = key
+            try:
+                r = api("conversations.replies",
+                        {"channel": cid, "ts": ts, "limit": 1},
+                        xoxc, xoxd, form=True)
+                if not r.get("ok") and r.get("error") in (
+                        "thread_not_found", "message_not_found"):
+                    return key
+            except Exception:
+                pass
+            return None
+        with ThreadPoolExecutor(max_workers=8) as ex:
+            for key in ex.map(_is_dead, list(thread_keys)):
+                if key:
+                    dead_threads.add(key)
+
+    def dest_visible(x):
+        cid = x.get("channel_id")
+        if cid in hidden:
+            return False
+        ts = x.get("thread_ts")
+        if ts and (cid, ts) in dead_threads:
+            return False
+        return True
 
     def is_visible(d):
         dests = d.get("destinations") or []
         if not dests:
             return True
-        return any(x.get("channel_id") not in archived for x in dests)
+        return any(dest_visible(x) for x in dests)
 
     return sum(1 for d in actives if is_visible(d)), method
 
