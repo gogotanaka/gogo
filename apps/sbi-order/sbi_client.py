@@ -14,18 +14,24 @@
 安全に関する方針:
 - 想定外の画面（デバイス認証・エラー・見つからない要素等）が出たら、自動で
   突破しようとせず HumanInterventionRequired を投げて処理を止める
-- ブラウザは既定で headed（画面表示あり）。人間がその場で操作を引き継げる
-  ようにするため。動作が安定してから SBI_HEADLESS=true への切替を検討する
-- パスキーは自動化しない（技術的にもできないし、すべきでもない）。ログインは
-  ID/パスワードで行う
-"""
-import os
+- パスキーは自動化しない（技術的にもできないし、すべきでもない）。パスキーは
+  普段使っているブラウザ側のプロファイルに紐づくため、Playwright専用の
+  まっさらなブラウザではなく、ユーザーが普段ログインに使っているブラウザに
+  CDP (Chrome DevTools Protocol) 経由で接続する（ログイン自体はブラウザ側で
+  人間が行う。apps/mf-pl/send_slack.py の Slack CDP フォールバックと同じ発想）
 
+事前準備: 普段使っているChromeを一度完全終了し、リモートデバッグを有効にして
+起動し直す必要がある（既存プロセスに後からは付けられない）:
+
+    open -a "Google Chrome" --args --remote-debugging-port=9223 --remote-allow-origins=*
+
+そのChromeでSBIに（パスキーで）ログインしておけば、このクライアントがそのタブに
+接続して以降の操作を行う。
+"""
 from playwright.sync_api import sync_playwright
 
-from config import CONF_DIR, ENV
+from config import ENV
 
-USER_DATA_DIR = os.path.join(CONF_DIR, "browser_data")
 LOGIN_URL = "https://site1.sbisec.co.jp/ETGate/"
 
 # NEEDS_SELECTORS: 実際の注文入力画面・注文照会画面・個別銘柄画面のURLに置き換える。
@@ -45,68 +51,57 @@ class HumanInterventionRequired(Exception):
 class SBIClient:
     def __init__(self):
         self.env = ENV
-        missing = [k for k in ("SBI_USER_ID", "SBI_LOGIN_PASSWORD") if not self.env.get(k)]
-        if missing:
-            raise RuntimeError(
-                f"config/.env に {', '.join(missing)} がありません。"
-                " config/.env.example を config/.env にコピーして値を埋めてください。")
+        self.cdp_url = self.env.get("SBI_CDP_URL", "http://localhost:9223")
         self._pw = None
+        self._browser = None
         self._context = None
         self.page = None
 
     # --- lifecycle ---
 
     def start(self):
-        os.makedirs(USER_DATA_DIR, mode=0o700, exist_ok=True)
-        headless = self.env.get("SBI_HEADLESS", "false").lower() == "true"
         self._pw = sync_playwright().start()
-        self._context = self._pw.chromium.launch_persistent_context(
-            USER_DATA_DIR, headless=headless, locale="ja-JP")
-        self.page = (
-            self._context.pages[0] if self._context.pages else self._context.new_page()
-        )
+        try:
+            self._browser = self._pw.chromium.connect_over_cdp(self.cdp_url)
+        except Exception as e:
+            self._pw.stop()
+            self._pw = None
+            raise HumanInterventionRequired(
+                f"普段使っているブラウザ ({self.cdp_url}) に接続できません。"
+                " 一度完全終了してから、次のコマンドで起動し直してください:\n"
+                '  open -a "Google Chrome" --args'
+                f" --remote-debugging-port={self.cdp_url.rsplit(':', 1)[-1]}"
+                " --remote-allow-origins=*\n"
+                f"（元のエラー: {e}）"
+            )
+        self._context = self._browser.contexts[0] if self._browser.contexts else self._browser.new_context()
+        self.page = next(
+            (p for p in self._context.pages if "sbisec.co.jp" in p.url), None
+        ) or (self._context.pages[0] if self._context.pages else self._context.new_page())
         return self
 
     def stop(self):
-        if self._context:
-            self._context.close()
+        # CDP接続は既存ブラウザを間借りしているだけなので、context/browser を
+        # close() してはいけない（ユーザーの実ブラウザが閉じてしまう）。
         if self._pw:
             self._pw.stop()
 
     # --- login ---
 
     def ensure_logged_in(self):
-        self.page.goto(LOGIN_URL, wait_until="domcontentloaded")
+        if "sbisec.co.jp" not in self.page.url:
+            self.page.goto(LOGIN_URL, wait_until="domcontentloaded")
         if self._is_logged_in():
             return
-        self._login()
-        if not self._is_logged_in():
-            raise HumanInterventionRequired(
-                "ログイン後、ログイン済み判定に失敗しました。ブラウザの画面を確認し、"
-                "デバイス認証・パスキー要求・エラー表示等が出ていれば手動で対応してください。"
-                "対応後にもう一度発注を実行すれば続きから進みます。"
-            )
+        raise HumanInterventionRequired(
+            "SBIにログインしていません。普段使っているブラウザ側でパスキーログインを"
+            "行ってください。ログインが完了すれば次回のチェックで自動的に検知します。"
+        )
 
     def _is_logged_in(self):
         # NEEDS_SELECTORS: ログイン済みのときだけ出る要素（口座番号・ログアウトリンク等）
         # に置き換える。ひとまず「ログアウト」というテキストの有無で仮判定している。
         return self.page.get_by_text("ログアウト").count() > 0
-
-    def _login(self):
-        # NEEDS_SELECTORS: 実際のログインフォームの id/name/placeholder に置き換える。
-        # SBIはパスキーを優先表示することがあるため、「ユーザーネームでログイン」等の
-        # 切り替えリンクが必要な場合は、ここでそれを先にクリックする処理を足す。
-        try:
-            self.page.get_by_placeholder("ユーザーネーム").fill(self.env["SBI_USER_ID"])
-            self.page.get_by_placeholder("パスワード").fill(self.env["SBI_LOGIN_PASSWORD"])
-            self.page.get_by_role("button", name="ログイン").click()
-            self.page.wait_for_load_state("networkidle", timeout=15000)
-        except Exception as e:
-            raise HumanInterventionRequired(
-                f"ログインフォームの操作に失敗しました（セレクタが実際の画面と"
-                f"合っていない可能性が高い。sbi_client.py の _login を codegen の"
-                f"出力で差し替えてください）: {e}"
-            )
 
     # --- orders ---
 
