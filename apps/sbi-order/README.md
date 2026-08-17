@@ -59,8 +59,8 @@ SBI_TRADE_PASSWORD=取引パスワード   # 発注に必須。無いと place_o
 
 # 株価監視 → Slack通知
 SBI_WATCH_TICKERS=3930              # カンマ区切りで複数銘柄コード指定可（例: 3930,7203）
-SBI_PRICE_INTERVAL_MIN_SEC=1200     # 取得間隔の下限（秒）。既定20分
-SBI_PRICE_INTERVAL_MAX_SEC=1800     # 取得間隔の上限（秒）。既定30分。毎回この範囲でランダムに決める
+SBI_PRICE_INTERVAL_MIN_SEC=480      # 取得間隔の下限（秒）。既定8分
+SBI_PRICE_INTERVAL_MAX_SEC=720      # 取得間隔の上限（秒）。既定12分。毎回この範囲でランダムに決める
 SLACK_CHANNEL=C0BQEBW40V9           # 板情報・約定・ログイン依頼を投稿するチャンネルID
 SLACK_MENTION_USER=U09GPTXH00H      # ログイン依頼のメンション先／メンション発注を許可するユーザーID
 SBI_MAX_ORDER_VALUE_YEN=500000      # メンション発注の上限見積金額（円）。超えたら拒否する
@@ -140,7 +140,7 @@ different threadで壊れる）ため、発注処理・約定確認・株価取�
 注文を確認し、約定を検知したらmacOS通知 + `SLACK_CHANNEL` への投稿で知らせる。
 
 `SBI_WATCH_TICKERS` を設定していれば、`SBI_PRICE_INTERVAL_MIN_SEC`〜`SBI_PRICE_INTERVAL_MAX_SEC`
-（既定20〜30分）の範囲でランダムな間隔をおいて対象銘柄の板情報（気配値）を取得し、`SLACK_CHANNEL` に
+（既定8〜12分、10分前後）の範囲でランダムな間隔をおいて対象銘柄の板情報（気配値）を取得し、`SLACK_CHANNEL` に
 投稿し続ける。固定間隔にしていないのは、機械的なアクセスパターンを避けるため。
 
 ## 構成
