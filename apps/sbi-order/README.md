@@ -77,7 +77,7 @@ echo "xoxb-..." > config/slack_bot_token
 
 ### メンションでの発注（Events API, HTTP）
 
-`@bot 買い 3930 200 742`（買い/売り 銘柄コード 株数 価格）のようにこのアプリのSlack botへ
+`@bot buy 3930 200 742`（buy/sell 銘柄コード 株数 価格。買い/売りでも可）のようにこのアプリのSlack botへ
 メンションすると発注できる。安全のため: 発言者が `SLACK_MENTION_USER` と一致しない場合は
 無視、書式が厳密に一致しない場合も無視（どちらも理由をスレッドに返信するだけで発注はしない）、
 見積金額が `SBI_MAX_ORDER_VALUE_YEN`（既定50万円）を超える場合も拒否する。

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Slack メンション経由の注文コマンド受信 (Events API, HTTP Request URL)。
 
-例: `@gogo 買い 3930 200 742` のように、このアプリのSlack botにメンションで
+例: `@gogo buy 3930 200 742` のように、このアプリのSlack botにメンションで
 話しかけると発注できる。web.py の `/slack/events` にSlackがHTTPでPOSTしてくる
 イベントを handle_event() で処理する（Socket Modeは接続はできるのにイベントが
 実際には配送されない現象が解消できなかったため、HTTP方式に切り替えた）。
@@ -38,7 +38,7 @@ _COMMAND_RE = re.compile(
     re.IGNORECASE,
 )
 _CLEAR_ALL_RE = re.compile(r"^\s*clear\s+all\s*$", re.IGNORECASE)
-USAGE = "書式が正しくありません。例: `買い 3930 200 742`（買い/売り 銘柄コード 株数 価格）"
+USAGE = "書式が正しくありません。例: `buy 3930 200 742`（buy/sell 銘柄コード 株数 価格）"
 
 
 def _read_file(path):
