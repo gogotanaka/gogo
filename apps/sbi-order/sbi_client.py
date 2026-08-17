@@ -128,16 +128,20 @@ class SBIClient:
 
         現物取引・特定預り・当日中の指値注文を仮定している。side は 'buy' または 'sell'。
 
-        全ステップ実画面で動作確認済み（2026-08-17、はてな(3930) 現物買 200株 指値742円、
-        注文番号487で実際に発注済み）。フォームの各フィールド名:
+        全ステップ実画面で動作確認済み（2026-08-17/18、はてな(3930)で複数回実発注）。
+        フォームの各フィールド名:
           stock_sec_code(銘柄コード) / trade_kbn(0=現物買,1=現物売,2=信用買,3=信用売) /
           input_quantity(株数) / in_sasinari_kbn(' '=指値,'N'=成行,'G'=逆指値) /
           input_price(価格) / hitokutei_trade_kbn(0=特定預り,1=一般預り,H=NISA預り) /
           selected_limit_in(this_day=当日中) / trade_pwd(id=pwd3, 取引パスワード。
           同名で隠しダミーの pwd1/pwd2/pwd4 が並んでいるので id で指定すること)。
-          「注文確認画面へ」(id=botton1) → 確認画面 → 「注文発注」
-          (a:has(img[alt='注文発注'])、確認画面側は id が無い) の2段階。
-          「注文確認画面を省略」チェックボックスは絶対にチェックしない（誤発注防止）。
+
+          「注文確認画面を省略」(id=shouryaku) をチェックすると、「注文確認画面へ」
+          ボタン(id=botton1)が非表示になり、代わりに最終発注ボタン(id=botton2)が
+          その場で有効になる。確認画面は元々このコードが機械的にエラー有無を
+          判定するだけの中間チェックポイントで、人間が内容を見て判断している
+          わけではなかった（誤発注防止の実効性はほぼ無かった）ため、
+          ラウンドトリップを1回減らすためにチェックする方針にした。
         """
         if not self.env.get("SBI_TRADE_PASSWORD"):
             raise RuntimeError(
@@ -160,26 +164,18 @@ class SBIClient:
             self.page.locator(
                 "input[name='selected_limit_in'][value='this_day']"
             ).check()  # 当日中
+            self.page.locator("#shouryaku").check()  # 注文確認画面を省略
             self.page.locator("#pwd3").fill(self.env["SBI_TRADE_PASSWORD"])
-            self.page.locator("#botton1").click(timeout=10000)
-            self.page.wait_for_load_state("domcontentloaded")
-            self.page.wait_for_timeout(1000)
-
-            if self.page.get_by_text("取引パスワードが入力されていません", exact=False).count():
-                raise RuntimeError("取引パスワードが受け付けられませんでした（画面のエラー参照）")
-            if not self.page.get_by_text("注文確認", exact=False).count():
-                raise RuntimeError(
-                    "確認画面に進めませんでした。入力内容にエラーがある可能性があります。"
-                )
-
-            self.page.locator("a:has(img[alt='注文発注'])").first.click(timeout=10000)
+            self.page.locator("#botton2").click(timeout=10000)
             self.page.wait_for_load_state("domcontentloaded")
             self.page.wait_for_timeout(1500)
 
             if not self.page.get_by_text("ご注文を受け付けました", exact=False).count():
-                raise RuntimeError(
-                    "発注後の受付確認が画面に見つかりませんでした。ブラウザで状態を確認してください。"
-                )
+                # 発注入力画面に留まったままの場合、値幅制限超過等のエラーが
+                # 赤字で表示される（例:「注文価格が制限値幅を超えています」）。
+                # 正確な位置は不定なので、ページ本文の先頭付近をそのまま添える。
+                snippet = self.page.locator("body").inner_text(timeout=1000)[:300]
+                raise RuntimeError(f"発注が受け付けられませんでした: {snippet!r}")
             order_no_row = self.page.locator("tr:has-text('注文番号')").last
             return order_no_row.locator("td").last.inner_text().strip()
         except HumanInterventionRequired:

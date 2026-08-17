@@ -115,10 +115,11 @@ echo "xoxb-..." > config/slack_bot_token
 
 ## セレクタの状態（2026-08-17 実画面で確認済み）
 
-`_is_logged_in` / `check_order_status` / `get_price` / `get_order_book` / `place_order`
-（発注〜確認画面〜最終発注〜注文番号取得まで）は、実際にログイン済みのブラウザに接続して
-エンドツーエンドで動作確認済み。はてな(3930) 現物買 200株 指値742円で実際に発注し
-（注文番号487）、`docs/adr/0005` に記録した。
+`_is_logged_in` / `check_order_status` / `get_price` / `get_order_book` / `place_order` /
+`cancel_order` / `list_pending_order_ids` は、実際にログイン済みのブラウザに接続して
+エンドツーエンドで動作確認済み。`place_order` は「注文確認画面を省略」を有効にして
+確認画面を経由せず一発で発注する（`docs/adr/0009`）。はてな(3930)で複数回実発注・
+実取消して確認した（`docs/adr/0005`, `0008`, `0009`）。
 
 ## 使い方
 
