@@ -82,13 +82,14 @@ echo "xoxb-..." > config/slack_bot_token
 無視、書式が厳密に一致しない場合も無視（どちらも理由をスレッドに返信するだけで発注はしない）、
 見積金額が `SBI_MAX_ORDER_VALUE_YEN`（既定50万円）を超える場合も拒否する。
 
-有効にするには [api.slack.com/apps](https://api.slack.com/apps) の対象アプリ設定で:
+有効にするには、リポジトリルートの [`slack-app-manifest.json`](../../slack-app-manifest.json)
+の内容を [api.slack.com/apps](https://api.slack.com/apps) の対象アプリ →
+**App Manifest** タブに貼り付けて保存する（Bot Token Scopes・Socket Mode・
+`app_mention` イベント購読が一括で反映される）。保存後、変更されたスコープを
+反映するため上部の「Reinstall to Workspace」を実行する。
 
-1. **OAuth & Permissions** → Bot Token Scopes に `app_mentions:read` を追加 → 上部の
-   「Reinstall to Workspace」で再インストール（`chat:write` は既存のままでよい）
-2. **Socket Mode** → 有効化 → 表示される案内から **App-Level Tokens** で
-   `connections:write` スコープ付きのトークン（`xapp-...`）を発行
-3. **Event Subscriptions** → 有効化 → Subscribe to bot events に `app_mention` を追加 → 保存
+Socket Mode有効化に伴い、**App-Level Tokens** で `connections:write` スコープ付きの
+トークン（`xapp-...`）を発行する必要がある（これはmanifestに含められないので手動発行）。
 
 発行した `xapp-...` を保存する:
 
