@@ -75,27 +75,38 @@ echo "xoxb-..." > config/slack_bot_token
 `SLACK_CHANNEL` / `SLACK_MENTION_USER` を空にしておけば、その機能（板情報投稿・ログイン依頼の
 メンション）は無効化され、macOS通知のみになる。
 
-### メンションでの発注（Socket Mode）
+### メンションでの発注（Events API, HTTP）
 
 `@bot 買い 3930 200 742`（買い/売り 銘柄コード 株数 価格）のようにこのアプリのSlack botへ
 メンションすると発注できる。安全のため: 発言者が `SLACK_MENTION_USER` と一致しない場合は
 無視、書式が厳密に一致しない場合も無視（どちらも理由をスレッドに返信するだけで発注はしない）、
 見積金額が `SBI_MAX_ORDER_VALUE_YEN`（既定50万円）を超える場合も拒否する。
 
-有効にするには、リポジトリルートの [`slack-app-manifest.json`](../../slack-app-manifest.json)
-の内容を [api.slack.com/apps](https://api.slack.com/apps) の対象アプリ →
-**App Manifest** タブに貼り付けて保存する（Bot Token Scopes・Socket Mode・
-`app_mention` イベント購読が一括で反映される）。保存後、変更されたスコープを
-反映するため上部の「Reinstall to Workspace」を実行する。
+最初はSocket Modeで実装したが、接続自体はできるのに `app_mention` イベントが実際には
+配送されない現象が解消できず、HTTP Request URL方式（Slackがこのアプリの
+`/slack/events` に直接POSTしてくる）に切り替えた（`docs/adr/0007` 参照）。
 
-Socket Mode有効化に伴い、**App-Level Tokens** で `connections:write` スコープ付きの
-トークン（`xapp-...`）を発行する必要がある（これはmanifestに含められないので手動発行）。
+有効にするには:
 
-発行した `xapp-...` を保存する:
+1. リポジトリルートの [`slack-app-manifest.json`](../../slack-app-manifest.json) の内容を
+   [api.slack.com/apps](https://api.slack.com/apps) の対象アプリ → **App Manifest** タブに
+   貼り付けて保存（Bot Token Scopes・`app_mention` イベント購読が反映される。
+   Socket Modeは使わないので `socket_mode_enabled: false` のまま）。保存後、上部の
+   「Reinstall to Workspace」を実行する
+2. **Basic Information** → App Credentials → **Signing Secret** を取得し、保存する:
 
-```sh
-echo "xapp-..." > config/slack_app_token
-```
+   ```sh
+   echo "..." > config/slack_signing_secret
+   ```
+
+3. `python3 web.py` をポート8381で公開するトンネル/リバースプロキシを用意する
+   （このリポジトリでは `~/.cloudflared/config.yml` の名前付きトンネルに
+   `sbi-order.awsm.jp → http://localhost:8381` を追加する形にした。無料の
+   `cloudflared tunnel --url` クイックトンネルは、今回接続はできてもリクエストが
+   届かない・404になる現象が頻発したため避けている）
+4. **Event Subscriptions** → 有効化 → Request URL に `https://<公開URL>/slack/events`
+   を入力（保存時にSlackが自動でURL検証してくる。`{"challenge": "..."}` を返せば
+   「Verified」と表示される）→ Subscribe to bot events に `app_mention` を追加して保存
 
 `config/slack_app_token` が無い場合、メンション機能は無効のまま（他の機能には影響しない）。
 
@@ -137,7 +148,7 @@ different threadで壊れる）ため、発注処理・約定確認・株価取�
 | `order_store.py` | 発注記録の永続化（SQLite, `config/orders.db`） |
 | `notify.py` | macOS 通知（`osascript`） |
 | `slack_client.py` | Slack投稿（bot token, `chat.postMessage`） |
-| `mention_listener.py` | Slackメンションの受信・コマンド解析（Socket Mode） |
+| `mention_listener.py` | Slackメンションの受信・署名検証・コマンド解析（Events API, HTTP） |
 | `web.py` | ローカルWeb UI + 発注ワーカー + 約定ポーラー + 板情報ポーラー |
 
 ## 既知の制約

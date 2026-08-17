@@ -25,6 +25,7 @@ from config import ENV
 from sbi_client import HumanInterventionRequired, SBIClient, format_order_book
 
 PORT = 8381
+_BOT_USER_ID = None  # main()で解決。メンション本文から自分宛の<@ID>を取り除くのに使う。
 POLL_INTERVAL_SEC = 60
 # 株価取得の間隔は固定にせず、機械的なアクセスパターンにならないよう毎回この範囲でランダムに決める。
 PRICE_INTERVAL_MIN_SEC = int(ENV.get("SBI_PRICE_INTERVAL_MIN_SEC", "1200"))  # 20分
@@ -124,7 +125,7 @@ def _process_order(client, order_id):
 
 
 def _on_mention_command(parsed, channel, thread_ts, reply):
-    """Slackメンションの受信スレッドから呼ばれる（Socket Mode）。
+    """Slackメンションの受信（HTTPリクエストのスレッド）から呼ばれる。
     Playwrightには一切触らず、order_store と _work_q だけを操作する。
     """
     value = parsed["qty"] * parsed["price"]
@@ -264,6 +265,9 @@ class Handler(BaseHTTPRequestHandler):
         self._respond(200, _render(order_store.list_orders()))
 
     def do_POST(self):
+        if self.path == "/slack/events":
+            self._handle_slack_event()
+            return
         if self.path != "/orders":
             self.send_response(404)
             self.end_headers()
@@ -284,6 +288,18 @@ class Handler(BaseHTTPRequestHandler):
         _work_q.put(order_id)
         self._respond(200, _render(order_store.list_orders(), "発注をキューに入れました"))
 
+    def _handle_slack_event(self):
+        length = int(self.headers.get("Content-Length", 0))
+        raw_body = self.rfile.read(length)
+        print(f"[slack-event] received {length} bytes: {raw_body[:300]!r}", file=sys.stderr)
+        status, body = mention_listener.handle_event(
+            self.headers, raw_body, _BOT_USER_ID, _on_mention_command)
+        print(f"[slack-event] handled -> status={status} body={body[:200]!r}", file=sys.stderr)
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.end_headers()
+        self.wfile.write(body)
+
     def _respond(self, code, body):
         self.send_response(code)
         self.send_header("Content-Type", "text/html; charset=utf-8")
@@ -295,10 +311,28 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main():
+    global _BOT_USER_ID
     # ブラウザは起動時に立ち上げてログインし、以後常時起動しておく（都度開かない）。
     threading.Thread(target=_sbi_loop, daemon=True).start()
-    # Slackメンションでの発注受付（Socket Mode）。トークン未設定なら何もせず無効のまま。
-    mention_listener.start(_on_mention_command)
+
+    if mention_listener.enabled():
+        try:
+            _BOT_USER_ID = slack_client.bot_user_id()
+            print(
+                "[mention] メンション発注が有効です。このポート宛にトンネルが向いていれば、"
+                "Slackの Event Subscriptions → Request URL は "
+                "https://<トンネルのホスト名>/slack/events になります。",
+                file=sys.stderr,
+            )
+        except Exception as e:
+            print(f"[mention] bot_user_id の取得に失敗しました: {e}", file=sys.stderr)
+    else:
+        print(
+            "[mention] config/slack_signing_secret または SLACK_MENTION_USER が未設定のため、"
+            "メンションでの発注は無効です。",
+            file=sys.stderr,
+        )
+
     server = ThreadingHTTPServer(("127.0.0.1", PORT), Handler)
     print(f"Serving at http://localhost:{PORT}", file=sys.stderr)
     try:

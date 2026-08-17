@@ -47,3 +47,18 @@ def post(channel, text, thread_ts=None):
         resp = json.loads(r.read())
     if not resp.get("ok"):
         raise RuntimeError(f"chat.postMessage failed: {resp.get('error')}")
+
+
+def bot_user_id():
+    token = _bot_token()
+    if not token:
+        raise RuntimeError(f"Slack bot token がありません。{BOT_TOKEN_PATH} に置いてください。")
+    req = urllib.request.Request(
+        "https://slack.com/api/auth.test",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    with urllib.request.urlopen(req, timeout=15) as r:
+        resp = json.loads(r.read())
+    if not resp.get("ok"):
+        raise RuntimeError(f"auth.test failed: {resp.get('error')}")
+    return resp["user_id"]

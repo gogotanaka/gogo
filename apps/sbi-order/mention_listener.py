@@ -1,25 +1,33 @@
 #!/usr/bin/env python3
-"""Slack メンション経由の注文コマンド受信 (Socket Mode)。
+"""Slack メンション経由の注文コマンド受信 (Events API, HTTP Request URL)。
 
-例: `@sbi-order 買い 3930 200 742` のように、このアプリのSlack botにメンションで
-話しかけると発注できる。安全のため:
+例: `@gogo 買い 3930 200 742` のように、このアプリのSlack botにメンションで
+話しかけると発注できる。web.py の `/slack/events` にSlackがHTTPでPOSTしてくる
+イベントを handle_event() で処理する（Socket Modeは接続はできるのにイベントが
+実際には配送されない現象が解消できなかったため、HTTP方式に切り替えた）。
+
+安全のため:
 - 発言者が SLACK_MENTION_USER と一致しない場合は何もせず、権限が無い旨を返信するだけ
 - 書式が厳密に一致しない場合は何もせず、使い方を返信するだけ（曖昧な自然文解析はしない）
 - 金額の上限（SBI_MAX_ORDER_VALUE_YEN）を超える注文は拒否する（誤入力の暴走を防ぐ）
+- Slackの署名（X-Slack-Signature）を検証し、本物のSlackからのリクエストであることを
+  確認する（apps/mf-pl等と同様、このリポジトリはSlack SDK等のフレームワークを使わず
+  標準ライブラリで直接HTTP/署名検証を行う流儀にしている）
 
 このモジュールはSlackイベントの受信・検証・返信だけを行い、実際の発注（Playwright操作）
 は一切行わない。パース済みコマンドは on_command コールバック経由で web.py 側の
 キューに渡し、SBI/ブラウザに触る唯一のスレッド（_sbi_loop）がそこから処理する。
 """
+import hashlib
+import hmac
+import json
 import os
 import re
-import sys
-import threading
+import time
 
 from config import CONF_DIR, ENV
 
-BOT_TOKEN_PATH = os.path.join(CONF_DIR, "slack_bot_token")
-APP_TOKEN_PATH = os.path.join(CONF_DIR, "slack_app_token")
+SIGNING_SECRET_PATH = os.path.join(CONF_DIR, "slack_signing_secret")
 
 _SIDE_MAP = {
     "買い": "buy", "買": "buy", "buy": "buy",
@@ -40,6 +48,14 @@ def _read_file(path):
         return ""
 
 
+def signing_secret():
+    return os.environ.get("SLACK_SIGNING_SECRET") or _read_file(SIGNING_SECRET_PATH)
+
+
+def enabled():
+    return bool(signing_secret() and ENV.get("SLACK_MENTION_USER"))
+
+
 def parse_command(text, bot_user_id):
     """メンション本文からコマンドを取り出す。書式に合わなければ None。"""
     stripped = re.sub(rf"<@{re.escape(bot_user_id)}>", "", text).strip()
@@ -55,49 +71,67 @@ def parse_command(text, bot_user_id):
     }
 
 
-def start(on_command):
-    """Socket Modeリスナーをバックグラウンドスレッドで起動する。
+def verify_signature(headers, raw_body):
+    """Slackの署名検証 (https://api.slack.com/authentication/verifying-requests-from-slack)。"""
+    secret = signing_secret()
+    if not secret:
+        return False
+    timestamp = headers.get("X-Slack-Request-Timestamp", "")
+    signature = headers.get("X-Slack-Signature", "")
+    if not timestamp or not signature:
+        return False
+    try:
+        if abs(time.time() - int(timestamp)) > 60 * 5:
+            return False  # リプレイ攻撃対策: 5分以上古いリクエストは拒否
+    except ValueError:
+        return False
+    basestring = f"v0:{timestamp}:".encode() + raw_body
+    computed = "v0=" + hmac.new(secret.encode(), basestring, hashlib.sha256).hexdigest()
+    return hmac.compare_digest(computed, signature)
 
-    on_command(parsed, channel, thread_ts, reply) が、書式・権限チェックを通った
+
+def handle_event(headers, raw_body, bot_user_id, on_command):
+    """`/slack/events` へのPOSTを処理する。(status_code, response_body_bytes) を返す。
+
+    on_command(parsed, channel, thread_ts, reply) は、書式・権限チェックを通った
     コマンドについて呼ばれる。reply(text) はそのスレッドに返信するための関数。
-    トークンが無ければ何もせず None を返す（メンション機能は無効のまま動く）。
+    Slackの3秒タイムアウトに収まるよう、on_command は重い処理をせずキューに積むだけにすること。
     """
-    bot_token = os.environ.get("SLACK_BOT_TOKEN") or _read_file(BOT_TOKEN_PATH)
-    app_token = os.environ.get("SLACK_APP_TOKEN") or _read_file(APP_TOKEN_PATH)
+    if not verify_signature(headers, raw_body):
+        return 401, b"invalid signature"
+    try:
+        payload = json.loads(raw_body)
+    except ValueError:
+        return 400, b"bad json"
+
+    if payload.get("type") == "url_verification":
+        body = json.dumps({"challenge": payload.get("challenge", "")}).encode()
+        return 200, body
+
+    if payload.get("type") != "event_callback":
+        return 200, b"ok"
+    if headers.get("X-Slack-Retry-Num"):
+        return 200, b"ok (retry ignored)"  # 再送は無視（二重発注防止）
+
+    event = payload.get("event", {})
+    if event.get("type") != "app_mention" or event.get("bot_id"):
+        return 200, b"ok"
+
+    user = event.get("user")
+    channel = event.get("channel")
+    thread_ts = event.get("thread_ts") or event.get("ts")
     mention_user = ENV.get("SLACK_MENTION_USER", "")
-    if not (bot_token and app_token and mention_user):
-        print(
-            "[mention] SLACK_APP_TOKEN/SLACK_MENTION_USER が未設定のため、"
-            "メンションでの発注は無効です。",
-            file=sys.stderr,
-        )
-        return None
 
-    from slack_bolt import App
-    from slack_bolt.adapter.socket_mode import SocketModeHandler
+    def reply(text):
+        import slack_client
+        slack_client.post(channel, text, thread_ts=thread_ts)
 
-    app = App(token=bot_token)
-    bot_user_id = app.client.auth_test()["user_id"]
-
-    @app.event("app_mention")
-    def handle_mention(event, say):
-        user = event.get("user")
-        channel = event.get("channel")
-        thread_ts = event.get("thread_ts") or event.get("ts")
-
-        def reply(text):
-            say(text=text, thread_ts=thread_ts)
-
-        if user != mention_user:
-            reply("権限がありません（登録済みユーザーのみ発注できます）。")
-            return
-        parsed = parse_command(event.get("text", ""), bot_user_id)
-        if not parsed:
-            reply(USAGE)
-            return
-        on_command(parsed, channel, thread_ts, reply)
-
-    handler = SocketModeHandler(app, app_token)
-    threading.Thread(target=handler.start, daemon=True).start()
-    print("[mention] Slackメンションの受信を開始しました。", file=sys.stderr)
-    return handler
+    if user != mention_user:
+        reply("権限がありません（登録済みユーザーのみ発注できます）。")
+        return 200, b"ok"
+    parsed = parse_command(event.get("text", ""), bot_user_id)
+    if not parsed:
+        reply(USAGE)
+        return 200, b"ok"
+    on_command(parsed, channel, thread_ts, reply)
+    return 200, b"ok"
