@@ -36,19 +36,12 @@ SLACK_MENTION_USER = ENV.get("SLACK_MENTION_USER", "")
 def _now():
     return datetime.now(timezone.utc).isoformat()
 
+# Playwrightの同期APIはgreenlet実装のため、生成したスレッド以外から触ると
+# "Cannot switch to a different thread" で壊れる。そのため SBIClient（＝ブラウザ
+# とのやり取り全部）は _sbi_loop という単一のスレッドの中だけで生成・使用し、
+# 他のスレッド（HTTPサーバ）は queue.Queue 経由でしか関与しない。
 _work_q = queue.Queue()
-_client = None
-_client_lock = threading.Lock()
 _login_alert_sent = False
-
-
-def _get_client():
-    """SBIとのやり取りは全部1つのブラウザセッションに直列化する。ブラウザは常時起動しておく。"""
-    global _client
-    with _client_lock:
-        if _client is None:
-            _client = SBIClient().start()
-        return _client
 
 
 def _alert_login_needed(reason):
@@ -86,73 +79,94 @@ def _announce_fill(order):
             print(f"[slack] 約定通知の投稿に失敗しました: {e}", file=sys.stderr)
 
 
-def _worker_loop():
-    while True:
-        order_id = _work_q.get()
+def _process_order(client, order_id):
+    try:
+        client.ensure_logged_in()
+        _clear_login_alert()
+        order = order_store.get_order(order_id)
+        sbi_order_id = client.place_order(
+            order["ticker"], order["side"], order["qty"], order["price"])
+        order_store.update_order(
+            order_id, status="submitted", sbi_order_id=sbi_order_id,
+            submitted_at=_now())
+    except HumanInterventionRequired as e:
+        order_store.update_order(order_id, status="error", error_message=str(e))
+        _alert_login_needed(str(e))
+    except Exception as e:
+        order_store.update_order(order_id, status="error", error_message=str(e))
+        notify.notify("SBI注文: 発注に失敗しました", f"id={order_id}: {e}")
+
+
+def _poll_orders(client):
+    for order in order_store.pending_watch_orders():
+        if not order.get("sbi_order_id"):
+            continue
         try:
-            client = _get_client()
             client.ensure_logged_in()
             _clear_login_alert()
-            order = order_store.get_order(order_id)
-            sbi_order_id = client.place_order(
-                order["ticker"], order["side"], order["qty"], order["price"])
-            order_store.update_order(
-                order_id, status="submitted", sbi_order_id=sbi_order_id,
-                submitted_at=_now())
+            status = client.check_order_status(order["sbi_order_id"])
+            if status == "filled":
+                order_store.update_order(
+                    order["id"], status="filled", filled_at=_now(), notified_at=_now())
+                _announce_fill(order)
+            elif status == "cancelled":
+                order_store.update_order(order["id"], status="cancelled")
         except HumanInterventionRequired as e:
-            order_store.update_order(order_id, status="error", error_message=str(e))
             _alert_login_needed(str(e))
+            return  # ログインが必要なら残りの注文チェックも今回はスキップ
         except Exception as e:
-            order_store.update_order(order_id, status="error", error_message=str(e))
-            notify.notify("SBI注文: 発注に失敗しました", f"id={order_id}: {e}")
+            print(f"[poller] order {order['id']} の確認に失敗: {e}", file=sys.stderr)
 
 
-def _poller_loop():
-    while True:
-        time.sleep(POLL_INTERVAL_SEC)
-        for order in order_store.pending_watch_orders():
-            if not order.get("sbi_order_id"):
-                continue
-            try:
-                client = _get_client()
-                client.ensure_logged_in()
-                _clear_login_alert()
-                status = client.check_order_status(order["sbi_order_id"])
-                if status == "filled":
-                    order_store.update_order(
-                        order["id"], status="filled", filled_at=_now(),
-                        notified_at=_now())
-                    _announce_fill(order)
-                elif status == "cancelled":
-                    order_store.update_order(order["id"], status="cancelled")
-            except HumanInterventionRequired as e:
-                _alert_login_needed(str(e))
-            except Exception as e:
-                print(f"[poller] order {order['id']} の確認に失敗: {e}", file=sys.stderr)
+def _poll_price(client):
+    try:
+        client.ensure_logged_in()
+        _clear_login_alert()
+        lines = [f"{t}: {client.get_price(t)}円" for t in WATCH_TICKERS]
+        slack_client.post(SLACK_CHANNEL, "\n".join(lines))
+    except HumanInterventionRequired as e:
+        _alert_login_needed(str(e))
+    except Exception as e:
+        print(f"[price] 株価取得に失敗しました: {e}", file=sys.stderr)
 
 
-def _price_poller_loop():
-    if not WATCH_TICKERS:
-        print("[price] SBI_WATCH_TICKERS が未設定のため株価監視は行いません", file=sys.stderr)
-        return
-    if not SLACK_CHANNEL:
+def _sbi_loop():
+    """SBI/ブラウザに触る唯一のスレッド。発注キューの処理・約定確認・株価投稿を
+    このスレッドの中で順番に行う（Playwrightの同期APIはスレッドを跨げないため）。
+    """
+    watch_price = bool(WATCH_TICKERS and SLACK_CHANNEL)
+    if WATCH_TICKERS and not SLACK_CHANNEL:
         print("[price] SLACK_CHANNEL が未設定のため株価監視は行いません", file=sys.stderr)
-        return
+
+    client = SBIClient().start()
+    try:
+        client.ensure_logged_in()
+        _clear_login_alert()
+    except HumanInterventionRequired as e:
+        _alert_login_needed(str(e))
+    except Exception as e:
+        print(f"[startup] 起動時ログインに失敗しました: {e}", file=sys.stderr)
+
+    next_order_poll = time.monotonic() + POLL_INTERVAL_SEC
+    next_price_poll = (
+        time.monotonic() + random.uniform(PRICE_INTERVAL_MIN_SEC, PRICE_INTERVAL_MAX_SEC)
+        if watch_price else None
+    )
+
     while True:
         try:
-            client = _get_client()
-            client.ensure_logged_in()
-            _clear_login_alert()
-            lines = []
-            for ticker in WATCH_TICKERS:
-                price = client.get_price(ticker)
-                lines.append(f"{ticker}: {price}円")
-            slack_client.post(SLACK_CHANNEL, "\n".join(lines))
-        except HumanInterventionRequired as e:
-            _alert_login_needed(str(e))
-        except Exception as e:
-            print(f"[price] 株価取得に失敗しました: {e}", file=sys.stderr)
-        time.sleep(random.uniform(PRICE_INTERVAL_MIN_SEC, PRICE_INTERVAL_MAX_SEC))
+            order_id = _work_q.get(timeout=1)
+            _process_order(client, order_id)
+        except queue.Empty:
+            pass
+
+        now = time.monotonic()
+        if now >= next_order_poll:
+            _poll_orders(client)
+            next_order_poll = now + POLL_INTERVAL_SEC
+        if watch_price and now >= next_price_poll:
+            _poll_price(client)
+            next_price_poll = now + random.uniform(PRICE_INTERVAL_MIN_SEC, PRICE_INTERVAL_MAX_SEC)
 
 
 # --- HTML ---
@@ -233,17 +247,7 @@ class Handler(BaseHTTPRequestHandler):
 
 def main():
     # ブラウザは起動時に立ち上げてログインし、以後常時起動しておく（都度開かない）。
-    try:
-        _get_client().ensure_logged_in()
-        _clear_login_alert()
-    except HumanInterventionRequired as e:
-        _alert_login_needed(str(e))
-    except Exception as e:
-        print(f"[startup] 起動時ログインに失敗しました: {e}", file=sys.stderr)
-
-    threading.Thread(target=_worker_loop, daemon=True).start()
-    threading.Thread(target=_poller_loop, daemon=True).start()
-    threading.Thread(target=_price_poller_loop, daemon=True).start()
+    threading.Thread(target=_sbi_loop, daemon=True).start()
     server = ThreadingHTTPServer(("127.0.0.1", PORT), Handler)
     print(f"Serving at http://localhost:{PORT}", file=sys.stderr)
     try:

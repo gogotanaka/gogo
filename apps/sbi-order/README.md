@@ -74,26 +74,23 @@ echo "xoxb-..." > config/slack_bot_token
 `SLACK_CHANNEL` / `SLACK_MENTION_USER` を空にしておけば、その機能（株価投稿・ログイン依頼の
 メンション）は無効化され、macOS通知のみになる。
 
-## セレクタの差し替えが必須
+## セレクタの状態（2026-08-17 実画面で確認済み）
 
-ログイン画面・注文入力画面・注文照会画面は認証必須のため、実物を見ずに `sbi_client.py` を
-書いている。`NEEDS_SELECTORS` とコメントが付いている箇所は全部プレースホルダーで、
-このままでは動かない。以下の手順で実際のセレクタに差し替えること。
+`_is_logged_in` / `check_order_status` / `get_price` / `place_order`（フォーム入力まで）は
+実際にログイン済みのブラウザに接続して動作確認済み（スクリーンショットで見た目も確認した）。
 
-```sh
-playwright codegen https://site1.sbisec.co.jp/ETGate
-```
+**唯一残っているのは `place_order` の「注文確認画面へ」ボタンから先**（確認画面の内容・
+最終発注ボタン・発注後の注文番号の取得）。本物の注文が発注されてしまうリスクがあるため、
+この場ではクリックして確認していない。現状は確認画面に進む直前で `HumanInterventionRequired`
+を投げて安全に止まる。
 
-開いたブラウザで実際にログイン → 何か1つ買い注文を入力 → 確認画面まで自分の手で操作する。
-Codegen ウィンドウに生成される `page.get_by_role(...)` / `page.locator(...)` 等のコードを、
-`sbi_client.py` の対応箇所（`_is_logged_in` / `place_order` / `check_order_status` / `get_price`）
-にコピーしてくる。特に以下は要確認:
+実装するには、一度だけ人間が手動で最後まで（確認画面→取引パスワード入力→発注）操作し、
+- 確認画面の最終発注ボタンの role/name（またはid）
+- 発注後の画面のどこに注文番号が表示されるか
 
-- ログイン済み判定に使える、ログイン後だけ出る要素（`_is_logged_in`）
-- 注文確認画面で取引パスワードが求められるかどうか（求められる前提のコードにしてある）
-- 発注後の確認画面のどこに注文番号が出るか
-- 注文照会画面での「約定」判定の文言・場所
-- 個別銘柄の現在値ページのURL・現在値要素（`get_price`）
+を確認して `sbi_client.py` の `place_order` に反映する必要がある。`playwright codegen
+https://site1.sbisec.co.jp/ETGate` で記録してもよいし、他のメソッドと同様に
+`page.locator(...).all()` 等でDOMを直接調べてもよい。
 
 ## 使い方
 
@@ -107,9 +104,11 @@ python3 web.py
 （自動突破はしない）。
 
 `http://localhost:8381` を開き、銘柄コード・売買・株数・指値価格を入力して発注する。
-発注はキューに積まれ、専用スレッドが順番に1件ずつ同じブラウザセッションで実行する
-（複数注文を同時並行では処理しない）。60秒おきに未約定の注文を確認し、約定を検知したら
-macOS通知 + `SLACK_CHANNEL` への投稿で知らせる。
+発注はキューに積まれ、SBI/ブラウザとのやり取りを専属で行う単一スレッド（`_sbi_loop`）が
+順番に処理する。Playwrightの同期APIはスレッドを跨いで使えない（Cannot switch to a
+different threadで壊れる）ため、発注処理・約定確認・株価取得は全部このスレッド1つに
+まとめてあり、HTTPサーバ側は `queue.Queue` 経由でしか関与しない。60秒おきに未約定の
+注文を確認し、約定を検知したらmacOS通知 + `SLACK_CHANNEL` への投稿で知らせる。
 
 `SBI_WATCH_TICKERS` を設定していれば、`SBI_PRICE_INTERVAL_MIN_SEC`〜`SBI_PRICE_INTERVAL_MAX_SEC`
 （既定20〜30分）の範囲でランダムな間隔をおいて対象銘柄の現在値を取得し、`SLACK_CHANNEL` に
@@ -120,7 +119,7 @@ macOS通知 + `SLACK_CHANNEL` への投稿で知らせる。
 | ファイル | 役割 |
 |---|---|
 | `config.py` | `config/.env` の読み込み（他モジュールで共有） |
-| `sbi_client.py` | Playwright によるログイン・発注・約定確認・株価取得（要セレクタ調整） |
+| `sbi_client.py` | Playwright によるログイン・発注・約定確認・株価取得（発注の最終確定のみ未実装） |
 | `order_store.py` | 発注記録の永続化（SQLite, `config/orders.db`） |
 | `notify.py` | macOS 通知（`osascript`） |
 | `slack_client.py` | Slack投稿（bot token, `chat.postMessage`） |
