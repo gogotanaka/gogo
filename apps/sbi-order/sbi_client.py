@@ -198,12 +198,7 @@ class SBIClient:
         約定株数 / 約定単価（実画面で確認済み）。約定済みかどうかは「全部約定」等、
         行のテキストに「約定」が含まれるかで判定している（未約定の行は「注文中」）。
         """
-        self.page.goto(HOME_URL, wait_until="domcontentloaded")
-        self.page.wait_for_timeout(1000)
-        self._click_visible_text("取引")
-        self.page.wait_for_load_state("domcontentloaded")
-        self._click_visible_text("注文照会")
-        self.page.wait_for_load_state("domcontentloaded")
+        self._open_order_inquiry()
 
         # tr:has-text() は入れ子テーブルだと外側の大きな行にもマッチしてしまうため、
         # 一番内側（＝実際のデータ行）である最後のマッチを使う。
@@ -220,6 +215,70 @@ class SBIClient:
         if "約定" in status_text:
             return "filled"
         return "submitted"
+
+    def _open_order_inquiry(self):
+        """「取引」→「注文照会」と辿り、注文一覧テーブルの画面を開く。"""
+        self.page.goto(HOME_URL, wait_until="domcontentloaded")
+        self.page.wait_for_timeout(1000)
+        self._click_visible_text("取引")
+        self.page.wait_for_load_state("domcontentloaded")
+        self._click_visible_text("注文照会")
+        self.page.wait_for_load_state("domcontentloaded")
+
+    def list_pending_order_ids(self):
+        """現在「注文中」（未約定・未取消）の全注文番号を返す。
+
+        rowspanで1論理行が複数<tr>にまたがる構造のため、tr単位でtd[0]が数字
+        （注文番号）かつtd[1]が「注文中」の行だけを拾う（実画面で確認済み）。
+        """
+        self._open_order_inquiry()
+        order_ids = []
+        for row in self.page.locator("table tr").all():
+            cells = row.locator("td").all()
+            if len(cells) < 2:
+                continue
+            try:
+                order_id = cells[0].inner_text(timeout=300).strip()
+                status = cells[1].inner_text(timeout=300).strip()
+            except Exception:
+                continue
+            if order_id.isdigit() and status == "注文中":
+                order_ids.append(order_id)
+        return order_ids
+
+    def cancel_order(self, sbi_order_id):
+        """指定注文番号を取消する。取消完了（受付済み）を確認できなければ
+        HumanInterventionRequired を投げる。
+
+        画面は発注の確認画面と違って1段階（内容確認＋取引パスワード入力＋
+        「注文取消」ボタンのみ）。取引パスワード欄は #pwd3（発注時と同じ、
+        隠しダミーpwd1/pwd2/pwd4が並ぶ）、ボタンは
+        input[name='ACT_place'][value='注文取消']。実画面で確認済み。
+        """
+        try:
+            self._open_order_inquiry()
+            row = self.page.locator(f"tr:has-text('{sbi_order_id}')").last
+            row.get_by_text("取消", exact=True).click(timeout=10000)
+            self.page.wait_for_load_state("domcontentloaded")
+            self.page.wait_for_timeout(1000)
+
+            trade_password = self.env.get("SBI_TRADE_PASSWORD")
+            if not trade_password:
+                raise RuntimeError("SBI_TRADE_PASSWORD が未設定です")
+            self.page.locator("#pwd3").fill(trade_password)
+            self.page.locator("input[name='ACT_place']").click(timeout=10000)
+            self.page.wait_for_load_state("domcontentloaded")
+            self.page.wait_for_timeout(1000)
+
+            if not self.page.get_by_text("ご注文を受け付けました", exact=False).count():
+                raise RuntimeError("取消の受付確認が画面に見つかりませんでした")
+        except HumanInterventionRequired:
+            raise
+        except Exception as e:
+            raise HumanInterventionRequired(
+                f"注文{sbi_order_id}の取消に失敗しました（セレクタが実際の画面と"
+                f"合っていない可能性があります。ブラウザの状態を確認してください）: {e}"
+            )
 
     # --- price watch ---
 

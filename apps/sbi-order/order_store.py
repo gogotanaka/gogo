@@ -72,5 +72,16 @@ def pending_watch_orders():
         return [dict(r) for r in rows]
 
 
+def update_order_by_sbi_id(sbi_order_id, **fields):
+    """SBI側の注文番号でローカル記録を更新する（clear all等、SBI側を先に
+    操作してからローカルに反映するケース用）。該当レコードが無くても何もしない。"""
+    if not fields:
+        return
+    cols = ", ".join(f"{k} = ?" for k in fields)
+    with _conn() as conn:
+        conn.execute(f"UPDATE orders SET {cols} WHERE sbi_order_id = ?",
+                     (*fields.values(), sbi_order_id))
+
+
 def _now():
     return datetime.now(timezone.utc).isoformat()

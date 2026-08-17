@@ -14,7 +14,7 @@ import sys
 import threading
 import time
 import urllib.parse
-from datetime import datetime, timezone
+from datetime import datetime, time as dt_time, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import mention_listener
@@ -35,6 +35,19 @@ SLACK_CHANNEL = ENV.get("SLACK_CHANNEL", "")
 SLACK_MENTION_USER = ENV.get("SLACK_MENTION_USER", "")
 # メンション経由の注文への安全弁: 見積金額がこれを超えたら発注せず拒否する。
 MAX_ORDER_VALUE_YEN = float(ENV.get("SBI_MAX_ORDER_VALUE_YEN", "500000"))
+
+JST = timezone(timedelta(hours=9))
+
+
+def _is_market_hours(now=None):
+    """東証の取引時間帯（前場9:00-11:30, 後場12:30-15:30, 平日のみ）かどうか。
+    祝日カレンダーまでは見ておらず、土日＋時間帯の簡易判定にとどめている。
+    """
+    now = now or datetime.now(JST)
+    if now.weekday() >= 5:  # 5=土, 6=日
+        return False
+    t = now.time()
+    return (dt_time(9, 0) <= t <= dt_time(11, 30)) or (dt_time(12, 30) <= t <= dt_time(15, 30))
 
 
 def _now():
@@ -143,7 +156,43 @@ def _on_mention_command(parsed, channel, thread_ts, reply):
         f"受け付けました: {parsed['ticker']} {parsed['side']} {parsed['qty']}株 "
         f"@ {parsed['price']}円 (見積 {value:,.0f}円)。処理します…"
     )
-    _work_q.put(order_id)
+    _work_q.put(("order", order_id))
+
+
+def _on_clear_all(channel, thread_ts, reply):
+    """`clear all` メンションを受けたときの入口（HTTPリクエストのスレッドから
+    呼ばれる）。Playwrightには一切触らず、キューに積むだけ。
+    """
+    reply("未約定の注文を全て取消します…")
+    _work_q.put(("clear_all", channel, thread_ts))
+
+
+def _process_clear_all(client, channel, thread_ts):
+    try:
+        client.ensure_logged_in()
+        _clear_login_alert()
+        order_ids = client.list_pending_order_ids()
+        if not order_ids:
+            slack_client.post(channel, "未約定の注文はありませんでした。", thread_ts=thread_ts)
+            return
+        lines = []
+        for sbi_order_id in order_ids:
+            try:
+                client.cancel_order(sbi_order_id)
+                order_store.update_order_by_sbi_id(sbi_order_id, status="cancelled")
+                lines.append(f"注文{sbi_order_id}: 取消しました")
+            except HumanInterventionRequired as e:
+                _alert_login_needed(str(e))
+                lines.append(f"注文{sbi_order_id}: 取消できませんでした（要対応）")
+            except Exception as e:
+                lines.append(f"注文{sbi_order_id}: 取消に失敗しました ({e})")
+        slack_client.post(channel, "全注文取消:\n" + "\n".join(lines), thread_ts=thread_ts)
+    except HumanInterventionRequired as e:
+        _alert_login_needed(str(e))
+        slack_client.post(
+            channel, f"取消処理を実行できませんでした（要対応）: {e}", thread_ts=thread_ts)
+    except Exception as e:
+        slack_client.post(channel, f"全注文取消でエラーが発生しました: {e}", thread_ts=thread_ts)
 
 
 def _poll_orders(client):
@@ -205,8 +254,11 @@ def _sbi_loop():
 
     while True:
         try:
-            order_id = _work_q.get(timeout=1)
-            _process_order(client, order_id)
+            item = _work_q.get(timeout=1)
+            if item[0] == "order":
+                _process_order(client, item[1])
+            elif item[0] == "clear_all":
+                _process_clear_all(client, item[1], item[2])
         except queue.Empty:
             pass
 
@@ -215,7 +267,8 @@ def _sbi_loop():
             _poll_orders(client)
             next_order_poll = now + POLL_INTERVAL_SEC
         if watch_price and now >= next_price_poll:
-            _poll_price(client)
+            if _is_market_hours():
+                _poll_price(client)
             next_price_poll = now + random.uniform(PRICE_INTERVAL_MIN_SEC, PRICE_INTERVAL_MAX_SEC)
 
 
@@ -285,7 +338,7 @@ class Handler(BaseHTTPRequestHandler):
             self._respond(400, _render(order_store.list_orders(), "入力値が不正です"))
             return
         order_id = order_store.create_order(ticker, side, qty, price)
-        _work_q.put(order_id)
+        _work_q.put(("order", order_id))
         self._respond(200, _render(order_store.list_orders(), "発注をキューに入れました"))
 
     def _handle_slack_event(self):
@@ -293,7 +346,7 @@ class Handler(BaseHTTPRequestHandler):
         raw_body = self.rfile.read(length)
         print(f"[slack-event] received {length} bytes: {raw_body[:300]!r}", file=sys.stderr)
         status, body = mention_listener.handle_event(
-            self.headers, raw_body, _BOT_USER_ID, _on_mention_command)
+            self.headers, raw_body, _BOT_USER_ID, _on_mention_command, _on_clear_all)
         print(f"[slack-event] handled -> status={status} body={body[:200]!r}", file=sys.stderr)
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")

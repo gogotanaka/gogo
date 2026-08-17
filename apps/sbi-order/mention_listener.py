@@ -37,6 +37,7 @@ _COMMAND_RE = re.compile(
     r"^\s*(買い|買|buy|売り|売|sell)\s+(\d+)\s+(\d+)\s+([\d.]+)\s*$",
     re.IGNORECASE,
 )
+_CLEAR_ALL_RE = re.compile(r"^\s*clear\s+all\s*$", re.IGNORECASE)
 USAGE = "書式が正しくありません。例: `買い 3930 200 742`（買い/売り 銘柄コード 株数 価格）"
 
 
@@ -56,10 +57,13 @@ def enabled():
     return bool(signing_secret() and ENV.get("SLACK_MENTION_USER"))
 
 
+def _strip_mention(text, bot_user_id):
+    return re.sub(rf"<@{re.escape(bot_user_id)}>", "", text).strip()
+
+
 def parse_command(text, bot_user_id):
     """メンション本文からコマンドを取り出す。書式に合わなければ None。"""
-    stripped = re.sub(rf"<@{re.escape(bot_user_id)}>", "", text).strip()
-    m = _COMMAND_RE.match(stripped)
+    m = _COMMAND_RE.match(_strip_mention(text, bot_user_id))
     if not m:
         return None
     side_raw, ticker, qty, price = m.groups()
@@ -69,6 +73,11 @@ def parse_command(text, bot_user_id):
         "qty": int(qty),
         "price": float(price),
     }
+
+
+def is_clear_all(text, bot_user_id):
+    """`clear all` という厳密な文字列（大文字小文字は無視）かどうか。"""
+    return bool(_CLEAR_ALL_RE.match(_strip_mention(text, bot_user_id)))
 
 
 def verify_signature(headers, raw_body):
@@ -90,12 +99,13 @@ def verify_signature(headers, raw_body):
     return hmac.compare_digest(computed, signature)
 
 
-def handle_event(headers, raw_body, bot_user_id, on_command):
+def handle_event(headers, raw_body, bot_user_id, on_command, on_clear_all):
     """`/slack/events` へのPOSTを処理する。(status_code, response_body_bytes) を返す。
 
     on_command(parsed, channel, thread_ts, reply) は、書式・権限チェックを通った
-    コマンドについて呼ばれる。reply(text) はそのスレッドに返信するための関数。
-    Slackの3秒タイムアウトに収まるよう、on_command は重い処理をせずキューに積むだけにすること。
+    発注コマンドについて呼ばれる。on_clear_all(channel, thread_ts, reply) は
+    `clear all` コマンドについて呼ばれる。reply(text) はそのスレッドに返信する関数。
+    Slackの3秒タイムアウトに収まるよう、どちらも重い処理をせずキューに積むだけにすること。
     """
     if not verify_signature(headers, raw_body):
         return 401, b"invalid signature"
@@ -129,7 +139,13 @@ def handle_event(headers, raw_body, bot_user_id, on_command):
     if user != mention_user:
         reply("権限がありません（登録済みユーザーのみ発注できます）。")
         return 200, b"ok"
-    parsed = parse_command(event.get("text", ""), bot_user_id)
+
+    text = event.get("text", "")
+    if is_clear_all(text, bot_user_id):
+        on_clear_all(channel, thread_ts, reply)
+        return 200, b"ok"
+
+    parsed = parse_command(text, bot_user_id)
     if not parsed:
         reply(USAGE)
         return 200, b"ok"
