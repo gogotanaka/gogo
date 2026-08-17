@@ -1,1 +1,2 @@
 playwright>=1.45
+slack_bolt>=1.18

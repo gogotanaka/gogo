@@ -17,6 +17,7 @@ import urllib.parse
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+import mention_listener
 import notify
 import order_store
 import slack_client
@@ -31,6 +32,8 @@ PRICE_INTERVAL_MAX_SEC = int(ENV.get("SBI_PRICE_INTERVAL_MAX_SEC", "1800"))  # 3
 WATCH_TICKERS = [t.strip() for t in ENV.get("SBI_WATCH_TICKERS", "").split(",") if t.strip()]
 SLACK_CHANNEL = ENV.get("SLACK_CHANNEL", "")
 SLACK_MENTION_USER = ENV.get("SLACK_MENTION_USER", "")
+# メンション経由の注文への安全弁: 見積金額がこれを超えたら発注せず拒否する。
+MAX_ORDER_VALUE_YEN = float(ENV.get("SBI_MAX_ORDER_VALUE_YEN", "500000"))
 
 
 def _now():
@@ -42,6 +45,10 @@ def _now():
 # 他のスレッド（HTTPサーバ）は queue.Queue 経由でしか関与しない。
 _work_q = queue.Queue()
 _login_alert_sent = False
+# Slackメンションから来た注文は、結果をそのスレッドにも返信する。
+# order_id -> (channel, thread_ts)。web UI経由の注文はここに登録されないので、
+# _reply_mention_result は何もせず無視するだけになる。
+_mention_reply_targets = {}
 
 
 def _alert_login_needed(reason):
@@ -79,6 +86,18 @@ def _announce_fill(order):
             print(f"[slack] 約定通知の投稿に失敗しました: {e}", file=sys.stderr)
 
 
+def _reply_mention_result(order_id, text):
+    """このorder_idがメンション経由なら、そのスレッドにも結果を返信する。"""
+    target = _mention_reply_targets.pop(order_id, None)
+    if not target:
+        return
+    channel, thread_ts = target
+    try:
+        slack_client.post(channel, text, thread_ts=thread_ts)
+    except Exception as e:
+        print(f"[mention] 結果の返信に失敗しました: {e}", file=sys.stderr)
+
+
 def _process_order(client, order_id):
     try:
         client.ensure_logged_in()
@@ -89,12 +108,41 @@ def _process_order(client, order_id):
         order_store.update_order(
             order_id, status="submitted", sbi_order_id=sbi_order_id,
             submitted_at=_now())
+        _reply_mention_result(
+            order_id,
+            f"発注しました: 注文番号{sbi_order_id} {order['ticker']} {order['side']}"
+            f" {order['qty']}株 @ {order['price']}円",
+        )
     except HumanInterventionRequired as e:
         order_store.update_order(order_id, status="error", error_message=str(e))
         _alert_login_needed(str(e))
+        _reply_mention_result(order_id, f"発注できませんでした（要対応）: {e}")
     except Exception as e:
         order_store.update_order(order_id, status="error", error_message=str(e))
         notify.notify("SBI注文: 発注に失敗しました", f"id={order_id}: {e}")
+        _reply_mention_result(order_id, f"発注に失敗しました: {e}")
+
+
+def _on_mention_command(parsed, channel, thread_ts, reply):
+    """Slackメンションの受信スレッドから呼ばれる（Socket Mode）。
+    Playwrightには一切触らず、order_store と _work_q だけを操作する。
+    """
+    value = parsed["qty"] * parsed["price"]
+    if value > MAX_ORDER_VALUE_YEN:
+        reply(
+            f"見積金額が上限（{MAX_ORDER_VALUE_YEN:,.0f}円）を超えるため発注しません: "
+            f"{parsed['ticker']} {parsed['qty']}株 @ {parsed['price']}円 "
+            f"(見積 {value:,.0f}円)。上限は SBI_MAX_ORDER_VALUE_YEN で変更できます。"
+        )
+        return
+    order_id = order_store.create_order(
+        parsed["ticker"], parsed["side"], parsed["qty"], parsed["price"])
+    _mention_reply_targets[order_id] = (channel, thread_ts)
+    reply(
+        f"受け付けました: {parsed['ticker']} {parsed['side']} {parsed['qty']}株 "
+        f"@ {parsed['price']}円 (見積 {value:,.0f}円)。処理します…"
+    )
+    _work_q.put(order_id)
 
 
 def _poll_orders(client):
@@ -249,6 +297,8 @@ class Handler(BaseHTTPRequestHandler):
 def main():
     # ブラウザは起動時に立ち上げてログインし、以後常時起動しておく（都度開かない）。
     threading.Thread(target=_sbi_loop, daemon=True).start()
+    # Slackメンションでの発注受付（Socket Mode）。トークン未設定なら何もせず無効のまま。
+    mention_listener.start(_on_mention_command)
     server = ThreadingHTTPServer(("127.0.0.1", PORT), Handler)
     print(f"Serving at http://localhost:{PORT}", file=sys.stderr)
     try:

@@ -61,18 +61,42 @@ SBI_TRADE_PASSWORD=取引パスワード   # 発注に必須。無いと place_o
 SBI_WATCH_TICKERS=3930              # カンマ区切りで複数銘柄コード指定可（例: 3930,7203）
 SBI_PRICE_INTERVAL_MIN_SEC=1200     # 取得間隔の下限（秒）。既定20分
 SBI_PRICE_INTERVAL_MAX_SEC=1800     # 取得間隔の上限（秒）。既定30分。毎回この範囲でランダムに決める
-SLACK_CHANNEL=C0BQEBW40V9           # 株価・約定・ログイン依頼を投稿するチャンネルID
-SLACK_MENTION_USER=U09GPTXH00H      # ログイン対応が必要なときにメンションするユーザーID
+SLACK_CHANNEL=C0BQEBW40V9           # 板情報・約定・ログイン依頼を投稿するチャンネルID
+SLACK_MENTION_USER=U09GPTXH00H      # ログイン依頼のメンション先／メンション発注を許可するユーザーID
+SBI_MAX_ORDER_VALUE_YEN=500000      # メンション発注の上限見積金額（円）。超えたら拒否する
 ```
 
-Slack bot トークンも別ファイルで置く（`chat:write` スコープ、上記チャンネルに招待済みであること）:
+Slack bot トークンも別ファイルで置く（上記チャンネルに招待済みであること）:
 
 ```sh
 echo "xoxb-..." > config/slack_bot_token
 ```
 
-`SLACK_CHANNEL` / `SLACK_MENTION_USER` を空にしておけば、その機能（株価投稿・ログイン依頼の
+`SLACK_CHANNEL` / `SLACK_MENTION_USER` を空にしておけば、その機能（板情報投稿・ログイン依頼の
 メンション）は無効化され、macOS通知のみになる。
+
+### メンションでの発注（Socket Mode）
+
+`@bot 買い 3930 200 742`（買い/売り 銘柄コード 株数 価格）のようにこのアプリのSlack botへ
+メンションすると発注できる。安全のため: 発言者が `SLACK_MENTION_USER` と一致しない場合は
+無視、書式が厳密に一致しない場合も無視（どちらも理由をスレッドに返信するだけで発注はしない）、
+見積金額が `SBI_MAX_ORDER_VALUE_YEN`（既定50万円）を超える場合も拒否する。
+
+有効にするには [api.slack.com/apps](https://api.slack.com/apps) の対象アプリ設定で:
+
+1. **OAuth & Permissions** → Bot Token Scopes に `app_mentions:read` を追加 → 上部の
+   「Reinstall to Workspace」で再インストール（`chat:write` は既存のままでよい）
+2. **Socket Mode** → 有効化 → 表示される案内から **App-Level Tokens** で
+   `connections:write` スコープ付きのトークン（`xapp-...`）を発行
+3. **Event Subscriptions** → 有効化 → Subscribe to bot events に `app_mention` を追加 → 保存
+
+発行した `xapp-...` を保存する:
+
+```sh
+echo "xapp-..." > config/slack_app_token
+```
+
+`config/slack_app_token` が無い場合、メンション機能は無効のまま（他の機能には影響しない）。
 
 ## セレクタの状態（2026-08-17 実画面で確認済み）
 
@@ -112,7 +136,8 @@ different threadで壊れる）ため、発注処理・約定確認・株価取�
 | `order_store.py` | 発注記録の永続化（SQLite, `config/orders.db`） |
 | `notify.py` | macOS 通知（`osascript`） |
 | `slack_client.py` | Slack投稿（bot token, `chat.postMessage`） |
-| `web.py` | ローカルWeb UI + 発注ワーカー + 約定ポーラー + 株価ポーラー |
+| `mention_listener.py` | Slackメンションの受信・コマンド解析（Socket Mode） |
+| `web.py` | ローカルWeb UI + 発注ワーカー + 約定ポーラー + 板情報ポーラー |
 
 ## 既知の制約
 
