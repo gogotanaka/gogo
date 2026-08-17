@@ -1,13 +1,9 @@
 #!/usr/bin/env python3
 """SBI証券 ブラウザ自動化クライアント (Playwright)。
 
-ログイン判定・株価取得・注文照会・発注フォームの入力は、実際にログイン済みの
-ブラウザに接続して動作確認済み（2026-08-17）。唯一 place_order の「注文確認画面へ」
-より先（確認画面・最終発注ボタン・注文番号の取得）だけは、本物の注文が発注されて
-しまうリスクがあるため未確認のまま残している。実装するには、一度人間が手動で
-最後まで操作し、確認画面のボタンと注文番号の表示箇所を確認する必要がある
-（`playwright codegen https://site1.sbisec.co.jp/ETGate` で記録するか、この
-ファイルの他メソッドと同様にDOMを直接調べる）。
+ログイン判定・株価取得・板情報取得・注文照会・発注（確認画面〜最終発注〜注文番号取得
+まで）は、実際にログイン済みのブラウザに接続してエンドツーエンドで動作確認済み
+（2026-08-17、はてな(3930) 現物買 200株 指値742円、注文番号487で実際に発注）。
 
 安全に関する方針:
 - 想定外の画面（デバイス認証・エラー・見つからない要素等）が出たら、自動で
@@ -132,23 +128,22 @@ class SBIClient:
 
         現物取引・特定預り・当日中の指値注文を仮定している。side は 'buy' または 'sell'。
 
-        フォームの各フィールド名・見た目は実際の画面（スクリーンショット）で確認済み:
+        全ステップ実画面で動作確認済み（2026-08-17、はてな(3930) 現物買 200株 指値742円、
+        注文番号487で実際に発注済み）。フォームの各フィールド名:
           stock_sec_code(銘柄コード) / trade_kbn(0=現物買,1=現物売,2=信用買,3=信用売) /
           input_quantity(株数) / in_sasinari_kbn(' '=指値,'N'=成行,'G'=逆指値) /
           input_price(価格) / hitokutei_trade_kbn(0=特定預り,1=一般預り,H=NISA預り) /
           selected_limit_in(this_day=当日中) / trade_pwd(id=pwd3, 取引パスワード。
           同名で隠しダミーの pwd1/pwd2/pwd4 が並んでいるので id で指定すること)。
-          入力後は「注文確認画面へ」というボタンで確認画面に進む（「注文確認画面を
-          省略」チェックボックスは絶対にチェックしないこと。誤発注防止のため）。
-
-        NEEDS_SELECTORS: 「注文確認画面へ」を押した先（確認画面の内容・最終発注
-        ボタンの role/name・発注後の注文番号の表示場所）は、実際にクリックすると
-        本物の注文が発注されてしまうためこの場では確認していない。一度だけ人間が
-        手動で最後まで操作し、確認画面のボタンと発注後の注文番号表示箇所を教えて
-        もらってから埋めること。それまでは place_order は確認画面に進む直前で
-        HumanInterventionRequired を投げて止まる（フォーム入力自体は実画面で
-        動作確認済み）。
+          「注文確認画面へ」(id=botton1) → 確認画面 → 「注文発注」
+          (a:has(img[alt='注文発注'])、確認画面側は id が無い) の2段階。
+          「注文確認画面を省略」チェックボックスは絶対にチェックしない（誤発注防止）。
         """
+        if not self.env.get("SBI_TRADE_PASSWORD"):
+            raise RuntimeError(
+                "config/.env に SBI_TRADE_PASSWORD がありません。取引パスワード無しでは"
+                "発注できません。"
+            )
         try:
             self._open_order_entry()
             self.page.locator("input[name='stock_sec_code']").fill(str(ticker))
@@ -165,21 +160,35 @@ class SBIClient:
             self.page.locator(
                 "input[name='selected_limit_in'][value='this_day']"
             ).check()  # 当日中
+            self.page.locator("#pwd3").fill(self.env["SBI_TRADE_PASSWORD"])
+            self.page.locator("#botton1").click(timeout=10000)
+            self.page.wait_for_load_state("domcontentloaded")
+            self.page.wait_for_timeout(1000)
+
+            if self.page.get_by_text("取引パスワードが入力されていません", exact=False).count():
+                raise RuntimeError("取引パスワードが受け付けられませんでした（画面のエラー参照）")
+            if not self.page.get_by_text("注文確認", exact=False).count():
+                raise RuntimeError(
+                    "確認画面に進めませんでした。入力内容にエラーがある可能性があります。"
+                )
+
+            self.page.locator("a:has(img[alt='注文発注'])").first.click(timeout=10000)
+            self.page.wait_for_load_state("domcontentloaded")
+            self.page.wait_for_timeout(1500)
+
+            if not self.page.get_by_text("ご注文を受け付けました", exact=False).count():
+                raise RuntimeError(
+                    "発注後の受付確認が画面に見つかりませんでした。ブラウザで状態を確認してください。"
+                )
+            order_no_row = self.page.locator("tr:has-text('注文番号')").last
+            return order_no_row.locator("td").last.inner_text().strip()
         except HumanInterventionRequired:
             raise
         except Exception as e:
             raise HumanInterventionRequired(
-                f"注文入力フォームの操作に失敗しました（セレクタが実際の画面と"
-                f"合っていない可能性が高い。place_order を確認してください）: {e}"
+                f"発注処理中にエラーが発生しました（想定外の画面の可能性があるため、"
+                f"安全のためここで停止します。ブラウザの状態を確認してください）: {e}"
             )
-
-        raise HumanInterventionRequired(
-            "発注フォームへの入力（銘柄・株数・価格・口座区分等）までは完了し、実画面で"
-            "見た目も確認済みです。ここから先の「注文確認画面へ」ボタン以降（取引パスワード"
-            "入力・最終発注ボタン・注文番号の取得）はまだ実装していません。ブラウザで内容を"
-            "確認し、必要なら手動で発注してください。自動化するには、一度手動で最後まで"
-            "操作した上で sbi_client.py の place_order を完成させる必要があります。"
-        )
 
     def check_order_status(self, sbi_order_id):
         """注文照会画面を開き、指定注文番号の状態を返す。
@@ -246,3 +255,86 @@ class SBIClient:
                 f"銘柄 {ticker} の株価取得に失敗しました（セレクタが実際の画面と"
                 f"合っていない可能性が高い。get_price を確認してください）: {e}"
             )
+
+    def get_order_book(self, ticker):
+        """指定銘柄の気配（板）を取得する。実画面で確認済み。
+
+        個別銘柄ページの「売気配株数／気配値／買気配株数」の3列テーブルを
+        そのまま構造化して返す。価格は基本的に高い方が先頭（降順）。
+        戻り値: [{'ask_qty': int|None, 'price': str, 'bid_qty': int|None}, ...]
+        price は "755.0" のような文字列、または "OVER"/"UNDER"/"成行" の場合がある。
+        """
+        self.page.goto(HOME_URL, wait_until="domcontentloaded")
+        try:
+            search = self.page.locator("#brand-search-text")
+            search.fill(str(ticker))
+            search.press("Enter")
+            self.page.wait_for_load_state("domcontentloaded")
+            header = self.page.get_by_text("売気配株数", exact=True).first
+            table = header.locator("xpath=ancestor::table[1]")
+
+            def _read_rows():
+                return table.evaluate(
+                    """t => Array.from(t.querySelectorAll('tbody tr')).map(tr =>
+                        Array.from(tr.querySelectorAll('td')).map(td => td.innerText.trim())
+                    )"""
+                )
+
+            # get_price 同様、値が "--" プレースホルダから実データに変わるまで
+            # 短い間隔でポーリングする（networkidle待ちはこのページでは使えない）。
+            raw_rows = _read_rows()
+            for _ in range(20):
+                if any(c and c not in ("成行", "OVER", "UNDER") and "--" not in c
+                       for row in raw_rows for c in row):
+                    break
+                self.page.wait_for_timeout(300)
+                raw_rows = _read_rows()
+
+            book = []
+            for cells in raw_rows:
+                if len(cells) != 3:
+                    continue
+                ask, price, bid = cells
+                if not price:
+                    continue
+                book.append({
+                    "ask_qty": _to_int(ask),
+                    "price": price,
+                    "bid_qty": _to_int(bid),
+                })
+            if not book:
+                raise RuntimeError("板データが空でした")
+            return book
+        except Exception as e:
+            raise HumanInterventionRequired(
+                f"銘柄 {ticker} の板情報取得に失敗しました（セレクタが実際の画面と"
+                f"合っていない可能性が高い。get_order_book を確認してください）: {e}"
+            )
+
+    def best_bid(self, ticker):
+        """買い板の一番（最良買気配）の (価格, 数量) を返す。無ければ None。"""
+        for row in self.get_order_book(ticker):
+            if row["bid_qty"]:
+                return row["price"], row["bid_qty"]
+        return None
+
+
+def _to_int(text):
+    text = text.replace(",", "").strip()
+    if not text:
+        return None
+    try:
+        return int(float(text))
+    except ValueError:
+        return None
+
+
+def format_order_book(ticker, book):
+    """板データをSlack投稿向けの等幅テキストに整形する。"""
+    lines = [f"*{ticker} 板*", "```", "売数量    気配値  買数量"]
+    for row in book:
+        ask = f"{row['ask_qty']:>6,}" if row["ask_qty"] else " " * 6
+        bid = f"{row['bid_qty']:>6,}" if row["bid_qty"] else ""
+        lines.append(f"{ask}  {row['price']:>6}  {bid}")
+    lines.append("```")
+    return "\n".join(lines)

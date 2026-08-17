@@ -21,7 +21,7 @@ import notify
 import order_store
 import slack_client
 from config import ENV
-from sbi_client import HumanInterventionRequired, SBIClient
+from sbi_client import HumanInterventionRequired, SBIClient, format_order_book
 
 PORT = 8381
 POLL_INTERVAL_SEC = 60
@@ -122,12 +122,13 @@ def _poll_price(client):
     try:
         client.ensure_logged_in()
         _clear_login_alert()
-        lines = [f"{t}: {client.get_price(t)}円" for t in WATCH_TICKERS]
-        slack_client.post(SLACK_CHANNEL, "\n".join(lines))
+        for ticker in WATCH_TICKERS:
+            book = client.get_order_book(ticker)
+            slack_client.post(SLACK_CHANNEL, format_order_book(ticker, book))
     except HumanInterventionRequired as e:
         _alert_login_needed(str(e))
     except Exception as e:
-        print(f"[price] 株価取得に失敗しました: {e}", file=sys.stderr)
+        print(f"[price] 板情報取得に失敗しました: {e}", file=sys.stderr)
 
 
 def _sbi_loop():

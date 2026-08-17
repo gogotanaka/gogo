@@ -1,7 +1,7 @@
 # sbi-order — SBI証券 指値注文の自動発注・約定通知
 
 指定した銘柄・株数・価格で成行/指値注文を出し、約定したら通知する。
-株価を定期的にSlackチャンネルへ流す機能もある。
+板情報（気配値）を定期的にSlackチャンネルへ流す機能もある。
 **「いつ・いくら買うか」の判断は人間が行う前提**で、発注操作・約定確認・株価共有だけを
 自動化する（価格条件を見て自動で買い判断をするロジックはこのアプリのスコープ外）。
 
@@ -55,7 +55,7 @@ open -a "Google Chrome" --args --remote-debugging-port=9223 --remote-allow-origi
 
 ```sh
 SBI_CDP_URL=http://localhost:9223   # 普段使っているブラウザのCDPエンドポイント
-SBI_TRADE_PASSWORD=取引パスワード   # 注文確認画面で聞かれる場合のみ使う。無ければ省略可
+SBI_TRADE_PASSWORD=取引パスワード   # 発注に必須。無いと place_order がエラーになる
 
 # 株価監視 → Slack通知
 SBI_WATCH_TICKERS=3930              # カンマ区切りで複数銘柄コード指定可（例: 3930,7203）
@@ -76,21 +76,10 @@ echo "xoxb-..." > config/slack_bot_token
 
 ## セレクタの状態（2026-08-17 実画面で確認済み）
 
-`_is_logged_in` / `check_order_status` / `get_price` / `place_order`（フォーム入力まで）は
-実際にログイン済みのブラウザに接続して動作確認済み（スクリーンショットで見た目も確認した）。
-
-**唯一残っているのは `place_order` の「注文確認画面へ」ボタンから先**（確認画面の内容・
-最終発注ボタン・発注後の注文番号の取得）。本物の注文が発注されてしまうリスクがあるため、
-この場ではクリックして確認していない。現状は確認画面に進む直前で `HumanInterventionRequired`
-を投げて安全に止まる。
-
-実装するには、一度だけ人間が手動で最後まで（確認画面→取引パスワード入力→発注）操作し、
-- 確認画面の最終発注ボタンの role/name（またはid）
-- 発注後の画面のどこに注文番号が表示されるか
-
-を確認して `sbi_client.py` の `place_order` に反映する必要がある。`playwright codegen
-https://site1.sbisec.co.jp/ETGate` で記録してもよいし、他のメソッドと同様に
-`page.locator(...).all()` 等でDOMを直接調べてもよい。
+`_is_logged_in` / `check_order_status` / `get_price` / `get_order_book` / `place_order`
+（発注〜確認画面〜最終発注〜注文番号取得まで）は、実際にログイン済みのブラウザに接続して
+エンドツーエンドで動作確認済み。はてな(3930) 現物買 200株 指値742円で実際に発注し
+（注文番号487）、`docs/adr/0005` に記録した。
 
 ## 使い方
 
@@ -111,7 +100,7 @@ different threadで壊れる）ため、発注処理・約定確認・株価取�
 注文を確認し、約定を検知したらmacOS通知 + `SLACK_CHANNEL` への投稿で知らせる。
 
 `SBI_WATCH_TICKERS` を設定していれば、`SBI_PRICE_INTERVAL_MIN_SEC`〜`SBI_PRICE_INTERVAL_MAX_SEC`
-（既定20〜30分）の範囲でランダムな間隔をおいて対象銘柄の現在値を取得し、`SLACK_CHANNEL` に
+（既定20〜30分）の範囲でランダムな間隔をおいて対象銘柄の板情報（気配値）を取得し、`SLACK_CHANNEL` に
 投稿し続ける。固定間隔にしていないのは、機械的なアクセスパターンを避けるため。
 
 ## 構成
@@ -119,7 +108,7 @@ different threadで壊れる）ため、発注処理・約定確認・株価取�
 | ファイル | 役割 |
 |---|---|
 | `config.py` | `config/.env` の読み込み（他モジュールで共有） |
-| `sbi_client.py` | Playwright によるログイン・発注・約定確認・株価取得（発注の最終確定のみ未実装） |
+| `sbi_client.py` | Playwright によるログイン・発注・約定確認・株価/板情報取得（発注含め実画面で確認済み） |
 | `order_store.py` | 発注記録の永続化（SQLite, `config/orders.db`） |
 | `notify.py` | macOS 通知（`osascript`） |
 | `slack_client.py` | Slack投稿（bot token, `chat.postMessage`） |
