@@ -40,14 +40,16 @@ JST = timezone(timedelta(hours=9))
 
 
 def _is_market_hours(now=None):
-    """東証の取引時間帯（前場9:00-11:30, 後場12:30-15:30, 平日のみ）かどうか。
-    祝日カレンダーまでは見ておらず、土日＋時間帯の簡易判定にとどめている。
+    """板が動いている時間帯（前場8:00-11:30, 後場12:05-15:30, 平日のみ）かどうか。
+    9:00/12:30の寄り付きより前から気配（板寄せ）が動くため、その分開始を
+    前倒ししている（ユーザー確認済みの実際の値）。祝日カレンダーまでは見ておらず、
+    土日＋時間帯の簡易判定にとどめている。
     """
     now = now or datetime.now(JST)
     if now.weekday() >= 5:  # 5=土, 6=日
         return False
     t = now.time()
-    return (dt_time(9, 0) <= t <= dt_time(11, 30)) or (dt_time(12, 30) <= t <= dt_time(15, 30))
+    return (dt_time(8, 0) <= t <= dt_time(11, 30)) or (dt_time(12, 5) <= t <= dt_time(15, 30))
 
 
 def _now():
