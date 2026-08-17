@@ -9,6 +9,7 @@ Usage: python3 web.py
 """
 import html
 import queue
+import random
 import sys
 import threading
 import time
@@ -24,7 +25,9 @@ from sbi_client import HumanInterventionRequired, SBIClient
 
 PORT = 8381
 POLL_INTERVAL_SEC = 60
-PRICE_INTERVAL_SEC = int(ENV.get("SBI_PRICE_INTERVAL_SEC", "300"))
+# 株価取得の間隔は固定にせず、機械的なアクセスパターンにならないよう毎回この範囲でランダムに決める。
+PRICE_INTERVAL_MIN_SEC = int(ENV.get("SBI_PRICE_INTERVAL_MIN_SEC", "1200"))  # 20分
+PRICE_INTERVAL_MAX_SEC = int(ENV.get("SBI_PRICE_INTERVAL_MAX_SEC", "1800"))  # 30分
 WATCH_TICKERS = [t.strip() for t in ENV.get("SBI_WATCH_TICKERS", "").split(",") if t.strip()]
 SLACK_CHANNEL = ENV.get("SLACK_CHANNEL", "")
 SLACK_MENTION_USER = ENV.get("SLACK_MENTION_USER", "")
@@ -149,7 +152,7 @@ def _price_poller_loop():
             _alert_login_needed(str(e))
         except Exception as e:
             print(f"[price] 株価取得に失敗しました: {e}", file=sys.stderr)
-        time.sleep(PRICE_INTERVAL_SEC)
+        time.sleep(random.uniform(PRICE_INTERVAL_MIN_SEC, PRICE_INTERVAL_MAX_SEC))
 
 
 # --- HTML ---

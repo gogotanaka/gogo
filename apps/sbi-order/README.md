@@ -42,7 +42,8 @@ SBI_HEADLESS=false                  # 既定で画面表示あり。動作確認
 
 # 株価監視 → Slack通知
 SBI_WATCH_TICKERS=3930              # カンマ区切りで複数銘柄コード指定可（例: 3930,7203）
-SBI_PRICE_INTERVAL_SEC=300          # 何秒おきに株価を取得・投稿するか（既定5分）
+SBI_PRICE_INTERVAL_MIN_SEC=1200     # 取得間隔の下限（秒）。既定20分
+SBI_PRICE_INTERVAL_MAX_SEC=1800     # 取得間隔の上限（秒）。既定30分。毎回この範囲でランダムに決める
 SLACK_CHANNEL=C0BQEBW40V9           # 株価・約定・ログイン依頼を投稿するチャンネルID
 SLACK_MENTION_USER=U09GPTXH00H      # ログイン対応が必要なときにメンションするユーザーID
 ```
@@ -93,8 +94,9 @@ Slackの `SLACK_CHANNEL` に `SLACK_MENTION_USER` へのメンション付きで
 （複数注文を同時並行では処理しない）。60秒おきに未約定の注文を確認し、約定を検知したら
 macOS通知 + `SLACK_CHANNEL` への投稿で知らせる。
 
-`SBI_WATCH_TICKERS` を設定していれば、`SBI_PRICE_INTERVAL_SEC` おき（既定5分）に
-対象銘柄の現在値を取得して `SLACK_CHANNEL` に投稿し続ける。
+`SBI_WATCH_TICKERS` を設定していれば、`SBI_PRICE_INTERVAL_MIN_SEC`〜`SBI_PRICE_INTERVAL_MAX_SEC`
+（既定20〜30分）の範囲でランダムな間隔をおいて対象銘柄の現在値を取得し、`SLACK_CHANNEL` に
+投稿し続ける。固定間隔にしていないのは、機械的なアクセスパターンを避けるため。
 
 ## 構成
 
@@ -112,7 +114,7 @@ macOS通知 + `SLACK_CHANNEL` への投稿で知らせる。
 - 価格・板情報は SBI の認証済みセッションから見る前提（外部の株価APIは使っていない）
 - ログインセッションは無操作60分程度で切れるとみられる。`ensure_logged_in` は各操作の前に
   毎回ログイン状態を確認し、切れていれば再ログインを試みる。それも失敗したらSlackで知らせる
-- 株価監視は市場が開いていない時間帯も含めて `SBI_PRICE_INTERVAL_SEC` おきに動き続ける
+- 株価監視は市場が開いていない時間帯も含めて20〜30分間隔で動き続ける
   （取引時間帯だけに絞る機能は無いので、必要なら `web.py` の起動・停止で調整する）
 - 5%を超えて保有する場合は大量保有報告書、取得割合次第ではTOB規制など、
   このツールの外側で別途の法規制がかかる。対象・規模次第では専門家への相談が前提になる
