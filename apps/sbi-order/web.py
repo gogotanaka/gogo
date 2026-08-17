@@ -18,10 +18,16 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import notify
 import order_store
+import slack_client
+from config import ENV
 from sbi_client import HumanInterventionRequired, SBIClient
 
 PORT = 8381
 POLL_INTERVAL_SEC = 60
+PRICE_INTERVAL_SEC = int(ENV.get("SBI_PRICE_INTERVAL_SEC", "300"))
+WATCH_TICKERS = [t.strip() for t in ENV.get("SBI_WATCH_TICKERS", "").split(",") if t.strip()]
+SLACK_CHANNEL = ENV.get("SLACK_CHANNEL", "")
+SLACK_MENTION_USER = ENV.get("SLACK_MENTION_USER", "")
 
 
 def _now():
@@ -30,15 +36,51 @@ def _now():
 _work_q = queue.Queue()
 _client = None
 _client_lock = threading.Lock()
+_login_alert_sent = False
 
 
 def _get_client():
-    """SBIとのやり取りは全部1つのブラウザセッションに直列化する。"""
+    """SBIとのやり取りは全部1つのブラウザセッションに直列化する。ブラウザは常時起動しておく。"""
     global _client
     with _client_lock:
         if _client is None:
             _client = SBIClient().start()
         return _client
+
+
+def _alert_login_needed(reason):
+    """ログインが必要（想定外の画面）になったときに一度だけ知らせる。連投は避ける。"""
+    global _login_alert_sent
+    notify.notify("SBI: ログインが必要です", reason)
+    if _login_alert_sent:
+        return
+    _login_alert_sent = True
+    if SLACK_CHANNEL and SLACK_MENTION_USER:
+        try:
+            slack_client.post(
+                SLACK_CHANNEL,
+                f"<@{SLACK_MENTION_USER}> SBIのログインが必要です。ブラウザ画面を確認してください。\n{reason}",
+            )
+        except Exception as e:
+            print(f"[slack] ログイン依頼の投稿に失敗しました: {e}", file=sys.stderr)
+
+
+def _clear_login_alert():
+    global _login_alert_sent
+    _login_alert_sent = False
+
+
+def _announce_fill(order):
+    text = (
+        f"約定しました: {order['ticker']} {order['side']} {order['qty']}株"
+        f" @ {order['price']}円"
+    )
+    notify.notify("約定しました", text)
+    if SLACK_CHANNEL:
+        try:
+            slack_client.post(SLACK_CHANNEL, text)
+        except Exception as e:
+            print(f"[slack] 約定通知の投稿に失敗しました: {e}", file=sys.stderr)
 
 
 def _worker_loop():
@@ -47,6 +89,7 @@ def _worker_loop():
         try:
             client = _get_client()
             client.ensure_logged_in()
+            _clear_login_alert()
             order = order_store.get_order(order_id)
             sbi_order_id = client.place_order(
                 order["ticker"], order["side"], order["qty"], order["price"])
@@ -55,7 +98,7 @@ def _worker_loop():
                 submitted_at=_now())
         except HumanInterventionRequired as e:
             order_store.update_order(order_id, status="error", error_message=str(e))
-            notify.notify("SBI注文: 人間の対応が必要です", str(e))
+            _alert_login_needed(str(e))
         except Exception as e:
             order_store.update_order(order_id, status="error", error_message=str(e))
             notify.notify("SBI注文: 発注に失敗しました", f"id={order_id}: {e}")
@@ -70,22 +113,43 @@ def _poller_loop():
             try:
                 client = _get_client()
                 client.ensure_logged_in()
+                _clear_login_alert()
                 status = client.check_order_status(order["sbi_order_id"])
                 if status == "filled":
                     order_store.update_order(
                         order["id"], status="filled", filled_at=_now(),
                         notified_at=_now())
-                    notify.notify(
-                        "約定しました",
-                        f"{order['ticker']} {order['side']} {order['qty']}株"
-                        f" @ {order['price']}円",
-                    )
+                    _announce_fill(order)
                 elif status == "cancelled":
                     order_store.update_order(order["id"], status="cancelled")
             except HumanInterventionRequired as e:
-                notify.notify("SBI注文: 人間の対応が必要です", str(e))
+                _alert_login_needed(str(e))
             except Exception as e:
                 print(f"[poller] order {order['id']} の確認に失敗: {e}", file=sys.stderr)
+
+
+def _price_poller_loop():
+    if not WATCH_TICKERS:
+        print("[price] SBI_WATCH_TICKERS が未設定のため株価監視は行いません", file=sys.stderr)
+        return
+    if not SLACK_CHANNEL:
+        print("[price] SLACK_CHANNEL が未設定のため株価監視は行いません", file=sys.stderr)
+        return
+    while True:
+        try:
+            client = _get_client()
+            client.ensure_logged_in()
+            _clear_login_alert()
+            lines = []
+            for ticker in WATCH_TICKERS:
+                price = client.get_price(ticker)
+                lines.append(f"{ticker}: {price}円")
+            slack_client.post(SLACK_CHANNEL, "\n".join(lines))
+        except HumanInterventionRequired as e:
+            _alert_login_needed(str(e))
+        except Exception as e:
+            print(f"[price] 株価取得に失敗しました: {e}", file=sys.stderr)
+        time.sleep(PRICE_INTERVAL_SEC)
 
 
 # --- HTML ---
@@ -165,8 +229,18 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main():
+    # ブラウザは起動時に立ち上げてログインし、以後常時起動しておく（都度開かない）。
+    try:
+        _get_client().ensure_logged_in()
+        _clear_login_alert()
+    except HumanInterventionRequired as e:
+        _alert_login_needed(str(e))
+    except Exception as e:
+        print(f"[startup] 起動時ログインに失敗しました: {e}", file=sys.stderr)
+
     threading.Thread(target=_worker_loop, daemon=True).start()
     threading.Thread(target=_poller_loop, daemon=True).start()
+    threading.Thread(target=_price_poller_loop, daemon=True).start()
     server = ThreadingHTTPServer(("127.0.0.1", PORT), Handler)
     print(f"Serving at http://localhost:{PORT}", file=sys.stderr)
     try:

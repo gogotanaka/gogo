@@ -23,36 +23,28 @@ import os
 
 from playwright.sync_api import sync_playwright
 
-CONF_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config")
+from config import CONF_DIR, ENV
+
 USER_DATA_DIR = os.path.join(CONF_DIR, "browser_data")
 LOGIN_URL = "https://site1.sbisec.co.jp/ETGate/"
 
-# NEEDS_SELECTORS: 実際の注文入力画面・注文照会画面のURLに置き換える。
+# NEEDS_SELECTORS: 実際の注文入力画面・注文照会画面・個別銘柄画面のURLに置き換える。
 ORDER_ENTRY_URL = "https://site1.sbisec.co.jp/ETGate/?OutSide=on&_ControlID=WPLETsiR001Control"
 ORDER_INQUIRY_URL = "https://site1.sbisec.co.jp/ETGate/?OutSide=on&_ControlID=WPLETorR001Control"
+QUOTE_URL_TEMPLATE = (
+    "https://site1.sbisec.co.jp/ETGate/?OutSide=on&_ControlID=WPLETmgR001Control"
+    "&_PageID=WPLETmgR001Mdtl20&i_stock_sec=stock&s_rkbn=2&i_dom_flg=1&i_exchange_code=JPN"
+    "&i_output_type=1&stock_sec_code_mul={ticker}"
+)
 
 
 class HumanInterventionRequired(Exception):
     """想定外の画面が出た。headed ブラウザで人間が対応してから再実行する。"""
 
 
-def _load_env():
-    env = dict(os.environ)
-    path = os.path.join(CONF_DIR, ".env")
-    if os.path.exists(path):
-        with open(path, encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line or line.startswith("#") or "=" not in line:
-                    continue
-                k, v = line.split("=", 1)
-                env.setdefault(k.strip(), v.strip())
-    return env
-
-
 class SBIClient:
     def __init__(self):
-        self.env = _load_env()
+        self.env = ENV
         missing = [k for k in ("SBI_USER_ID", "SBI_LOGIN_PASSWORD") if not self.env.get(k)]
         if missing:
             raise RuntimeError(
@@ -169,3 +161,18 @@ class SBIClient:
         if "取消" in text:
             return "cancelled"
         return "submitted"
+
+    # --- price watch ---
+
+    def get_price(self, ticker):
+        """指定銘柄の現在値（文字列, 例: "736"）を返す。"""
+        # NEEDS_SELECTORS: 個別銘柄ページの実際のURL・現在値要素に置き換える。
+        self.page.goto(QUOTE_URL_TEMPLATE.format(ticker=ticker), wait_until="domcontentloaded")
+        try:
+            price_text = self.page.locator(".stock_price").first.inner_text()
+            return price_text.strip()
+        except Exception as e:
+            raise HumanInterventionRequired(
+                f"銘柄 {ticker} の株価取得に失敗しました（セレクタが実際の画面と"
+                f"合っていない可能性が高い。get_price を codegen の出力で差し替えてください）: {e}"
+            )
