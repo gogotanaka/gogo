@@ -384,12 +384,18 @@ class SBIClient:
             )
 
     def get_order_book(self, ticker):
-        """指定銘柄の気配（板）を取得する。実画面で確認済み。
+        """指定銘柄の気配（板）と本日の出来高を取得する。実画面で確認済み。
 
         個別銘柄ページの「売気配株数／気配値／買気配株数」の3列テーブルを
         そのまま構造化して返す。価格は基本的に高い方が先頭（降順）。
-        戻り値: [{'ask_qty': int|None, 'price': str, 'bid_qty': int|None}, ...]
+        同じページ内にある出来高（#MTB0_5、株価テーブルのid構造は銘柄によらず
+        共通のはず。3930で確認済み。get_priceの#MTB0_0と同じ発想）も、
+        追加のページ遷移なしにあわせて読む。
+        戻り値: {'rows': [{'ask_qty': int|None, 'price': str, 'bid_qty': int|None}, ...],
+                 'volume': str|None}
         price は "755.0" のような文字列、または "OVER"/"UNDER"/"成行" の場合がある。
+        volume は出来高が読めなければ None（板情報自体は取れているので、これだけで
+        全体を失敗させない）。
         """
         self.page.goto(HOME_URL, wait_until="domcontentloaded")
         try:
@@ -431,16 +437,34 @@ class SBIClient:
                 })
             if not book:
                 raise RuntimeError("板データが空でした")
-            return book
+            return {"rows": book, "volume": self._read_volume()}
         except Exception as e:
             raise HumanInterventionRequired(
                 f"銘柄 {ticker} の板情報取得に失敗しました（セレクタが実際の画面と"
                 f"合っていない可能性が高い。get_order_book を確認してください）: {e}"
             )
 
+    def _read_volume(self):
+        """個別銘柄ページの出来高セル(#MTB0_5)を読む。取れなければNoneを返す
+        （板情報の取得自体は成功しているので、出来高だけで全体を失敗させない）。
+        """
+        cell = self.page.locator("#MTB0_5 .fm01").first
+        if cell.count() == 0:
+            return None
+        text = ""
+        for _ in range(5):
+            try:
+                text = cell.inner_text(timeout=1000).strip()
+            except Exception:
+                return None
+            if text and text != "--":
+                return text
+            self.page.wait_for_timeout(300)
+        return text or None
+
     def best_bid(self, ticker):
         """買い板の一番（最良買気配）の (価格, 数量) を返す。無ければ None。"""
-        for row in self.get_order_book(ticker):
+        for row in self.get_order_book(ticker)["rows"]:
             if row["bid_qty"]:
                 return row["price"], row["bid_qty"]
         return None
@@ -457,9 +481,14 @@ def _to_int(text):
 
 
 def format_order_book(ticker, book):
-    """板データをSlack投稿向けの等幅テキストに整形する。"""
-    lines = [f"*{ticker} 板*", "```", "売数量    気配値  買数量"]
-    for row in book:
+    """板データをSlack投稿向けの等幅テキストに整形する。
+    book は get_order_book() が返す {'rows': [...], 'volume': str|None} の形。
+    """
+    header = f"*{ticker} 板*"
+    if book.get("volume"):
+        header += f"（本日出来高: {book['volume']}株）"
+    lines = [header, "```", "売数量    気配値  買数量"]
+    for row in book["rows"]:
         ask = f"{row['ask_qty']:>6,}" if row["ask_qty"] else " " * 6
         bid = f"{row['bid_qty']:>6,}" if row["bid_qty"] else ""
         lines.append(f"{ask}  {row['price']:>6}  {bid}")
