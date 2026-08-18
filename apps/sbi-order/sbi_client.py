@@ -29,6 +29,8 @@ from config import ENV
 # ログイン前は site1、ログイン後の画面は site2 で提供される。
 LOGIN_URL = "https://site1.sbisec.co.jp/ETGate/"
 HOME_URL = "https://site2.sbisec.co.jp/ETGate/"
+# ID/PWでの自動ログイン用（パスキーとは別の専用ドメイン。実画面で確認済み）。
+LOGIN_ENTRY_URL = "https://login.sbisec.co.jp/login/entry"
 
 # このサイトは各ページのURLにセッション固有のトークン（_SeqNo等）が含まれる
 # 昔ながらの作りで、URLを直接 goto() しても再現できない。そのため各操作は
@@ -108,13 +110,55 @@ class SBIClient:
     def ensure_logged_in(self):
         if not self._page_is_alive():
             self._recover_crashed_page()
-        if "sbisec.co.jp" not in self.page.url:
-            self.page.goto(LOGIN_URL, wait_until="domcontentloaded")
+        # ログアウト直後の画面など、遷移済みの古いDOMには「ログアウト」という
+        # 文字列自体が残っていて _is_logged_in() が誤って True を返すことが
+        # 実際に確認された（2026-08-18）。必ず HOME_URL に一度遷移してから
+        # 判定することで、現在の実際のセッション状態を見るようにする。
+        self.page.goto(HOME_URL, wait_until="domcontentloaded")
         if self._is_logged_in():
             return
+        self._login()
+
+    def _login(self):
+        """ID・パスワードでの自動ログインを試みる。
+
+        パスキーとは別に、ID/PWでのログインには登録メールアドレス宛のOTP
+        （追加認証コード）が挟まることがある（2026-08-18、実画面で確認済み。
+        docs/adr/0012参照）。このOTPはメール受信箱へのアクセスが必要で、
+        自動化の対象外という方針（パスキー同様、突破しようとせず人間に委ねる）
+        のため、OTP画面が出た場合はそこで止めて HumanInterventionRequired を
+        投げる。呼び出し元(ensure_logged_in経由)が既存のSlack/mac通知経路で
+        アラートするので、人間がブラウザの画面でメールのコードを入力すれば
+        次回のチェックで自動的にログイン済みとして検知される。
+        """
+        user_id = self.env.get("SBI_USER_ID")
+        login_password = self.env.get("SBI_LOGIN_PASSWORD")
+        if not user_id or not login_password:
+            raise HumanInterventionRequired(
+                "SBIにログインしていません。config/.env に SBI_USER_ID / "
+                "SBI_LOGIN_PASSWORD が未設定のため自動ログインできません。"
+                "普段使っているブラウザ側でパスキーログインを行ってください。"
+            )
+        self.page.goto(LOGIN_ENTRY_URL, wait_until="domcontentloaded")
+        self.page.locator("input[name='username']").fill(user_id)
+        self.page.locator("input[name='password']").fill(login_password)
+        self.page.locator("#pw-btn").click(timeout=10000)
+        self.page.wait_for_load_state("domcontentloaded")
+        self.page.wait_for_timeout(2000)
+
+        if self._is_logged_in():
+            return
+        if "otp/entry" in self.page.url:
+            raise HumanInterventionRequired(
+                "自動ログイン(ID/PW)は成功しましたが、登録メールアドレス宛の"
+                "追加認証(OTP)が必要です。メールに届いたコードをブラウザの"
+                "画面に入力してログインを完了してください。完了すれば次回の"
+                "チェックで自動的に検知します。"
+            )
+        snippet = self.page.locator("body").inner_text(timeout=1000)[:300]
         raise HumanInterventionRequired(
-            "SBIにログインしていません。普段使っているブラウザ側でパスキーログインを"
-            "行ってください。ログインが完了すれば次回のチェックで自動的に検知します。"
+            f"自動ログインで想定外の画面になりました。ブラウザの状態を"
+            f"確認してください: {snippet!r}"
         )
 
     def _is_logged_in(self):
