@@ -38,7 +38,11 @@ _COMMAND_RE = re.compile(
     re.IGNORECASE,
 )
 _CLEAR_ALL_RE = re.compile(r"^\s*clear\s+all\s*$", re.IGNORECASE)
-USAGE = "書式が正しくありません。例: `buy 3930 200 742`（buy/sell 銘柄コード 株数 価格）"
+_BOOK_RE = re.compile(r"^\s*book(?:\s+(\d+))?\s*$", re.IGNORECASE)
+USAGE = (
+    "書式が正しくありません。例: `buy 3930 200 742`（buy/sell 銘柄コード 株数 価格）、"
+    "`clear all`（未約定注文を全取消）、`book`（板情報を投稿。`book 3930` で銘柄指定も可）"
+)
 
 
 def _read_file(path):
@@ -80,6 +84,17 @@ def is_clear_all(text, bot_user_id):
     return bool(_CLEAR_ALL_RE.match(_strip_mention(text, bot_user_id)))
 
 
+def parse_book(text, bot_user_id):
+    """`book` または `book 3930` を解析する。書式に合わなければ None。
+
+    戻り値: {'ticker': '3930'} または {'ticker': None}（銘柄未指定 = SBI_WATCH_TICKERS全部）
+    """
+    m = _BOOK_RE.match(_strip_mention(text, bot_user_id))
+    if not m:
+        return None
+    return {"ticker": m.group(1)}
+
+
 def verify_signature(headers, raw_body):
     """Slackの署名検証 (https://api.slack.com/authentication/verifying-requests-from-slack)。"""
     secret = signing_secret()
@@ -99,13 +114,15 @@ def verify_signature(headers, raw_body):
     return hmac.compare_digest(computed, signature)
 
 
-def handle_event(headers, raw_body, bot_user_id, on_command, on_clear_all):
+def handle_event(headers, raw_body, bot_user_id, on_command, on_clear_all, on_book):
     """`/slack/events` へのPOSTを処理する。(status_code, response_body_bytes) を返す。
 
     on_command(parsed, channel, thread_ts, reply) は、書式・権限チェックを通った
     発注コマンドについて呼ばれる。on_clear_all(channel, thread_ts, reply) は
-    `clear all` コマンドについて呼ばれる。reply(text) はそのスレッドに返信する関数。
-    Slackの3秒タイムアウトに収まるよう、どちらも重い処理をせずキューに積むだけにすること。
+    `clear all` コマンドについて、on_book(ticker, channel, thread_ts, reply) は
+    `book`/`book 3930` コマンドについて呼ばれる（tickerは未指定ならNone）。
+    reply(text) はそのスレッドに返信する関数。Slackの3秒タイムアウトに収まるよう、
+    いずれも重い処理をせずキューに積むだけにすること。
     """
     if not verify_signature(headers, raw_body):
         return 401, b"invalid signature"
@@ -143,6 +160,11 @@ def handle_event(headers, raw_body, bot_user_id, on_command, on_clear_all):
     text = event.get("text", "")
     if is_clear_all(text, bot_user_id):
         on_clear_all(channel, thread_ts, reply)
+        return 200, b"ok"
+
+    book = parse_book(text, bot_user_id)
+    if book is not None:
+        on_book(book["ticker"], channel, thread_ts, reply)
         return 200, b"ok"
 
     parsed = parse_command(text, bot_user_id)

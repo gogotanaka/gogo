@@ -169,6 +169,44 @@ def _on_clear_all(channel, thread_ts, reply):
     _work_q.put(("clear_all", channel, thread_ts))
 
 
+def _on_book_request(ticker, channel, thread_ts, reply):
+    """`book`/`book 3930` メンションを受けたときの入口（HTTPリクエストのスレッド
+    から呼ばれる）。Playwrightには一切触らず、キューに積むだけ。
+    """
+    reply("板情報を取得します…")
+    _work_q.put(("book", ticker, channel, thread_ts))
+
+
+def _process_book_request(client, ticker, channel, thread_ts):
+    tickers = [ticker] if ticker else WATCH_TICKERS
+    if not tickers:
+        slack_client.post(
+            channel,
+            "対象銘柄が指定されておらず、SBI_WATCH_TICKERSも未設定です。"
+            "`book 3930` のように銘柄コードを指定してください。",
+            thread_ts=thread_ts,
+        )
+        return
+    try:
+        client.ensure_logged_in()
+        _clear_login_alert()
+    except HumanInterventionRequired as e:
+        _alert_login_needed(str(e))
+        slack_client.post(channel, f"板情報を取得できませんでした（要対応）: {e}", thread_ts=thread_ts)
+        return
+    for t in tickers:
+        try:
+            book = client.get_order_book(t)
+            slack_client.post(channel, format_order_book(t, book), thread_ts=thread_ts)
+        except HumanInterventionRequired as e:
+            _alert_login_needed(str(e))
+            slack_client.post(
+                channel, f"{t}: 板情報の取得に失敗しました（要対応）: {e}", thread_ts=thread_ts)
+            return  # ログインが必要なら残りの銘柄も今回はスキップ
+        except Exception as e:
+            slack_client.post(channel, f"{t}: 板情報の取得に失敗しました: {e}", thread_ts=thread_ts)
+
+
 def _process_clear_all(client, channel, thread_ts):
     try:
         client.ensure_logged_in()
@@ -299,6 +337,8 @@ def _sbi_loop():
                 _process_order(client, item[1])
             elif item[0] == "clear_all":
                 _process_clear_all(client, item[1], item[2])
+            elif item[0] == "book":
+                _process_book_request(client, item[1], item[2], item[3])
         except queue.Empty:
             pass
         except Exception as e:
@@ -392,7 +432,8 @@ class Handler(BaseHTTPRequestHandler):
         raw_body = self.rfile.read(length)
         print(f"[slack-event] received {length} bytes: {raw_body[:300]!r}", file=sys.stderr)
         status, body = mention_listener.handle_event(
-            self.headers, raw_body, _BOT_USER_ID, _on_mention_command, _on_clear_all)
+            self.headers, raw_body, _BOT_USER_ID, _on_mention_command, _on_clear_all,
+            _on_book_request)
         print(f"[slack-event] handled -> status={status} body={body[:200]!r}", file=sys.stderr)
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")

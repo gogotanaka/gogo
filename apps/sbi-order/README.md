@@ -99,6 +99,10 @@ echo "xoxb-..." > config/slack_bot_token
 `@bot clear all` で、現在未約定の注文を全て取消する（1件ずつ取消し、結果をスレッドに
 まとめて返信する）。銘柄・数量の指定はできず、無条件に全部取消す点に注意。
 
+`@bot book` で、板情報（気配値）をその場で取得してスレッドに投稿する（定期投稿を
+待たずに済む）。対象は `SBI_WATCH_TICKERS` の全銘柄。`@bot book 3930` のように銘柄
+コードを指定すれば、その銘柄だけを投稿する。
+
 最初はSocket Modeで実装したが、接続自体はできるのに `app_mention` イベントが実際には
 配送されない現象が解消できず、HTTP Request URL方式（Slackがこのアプリの
 `/slack/events` に直接POSTしてくる）に切り替えた（`docs/adr/0007` 参照）。
