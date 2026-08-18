@@ -19,6 +19,21 @@ python3 apps/dashboard/web.py
 `/api/counts.json` は `{"fetched_at": ..., "from_cache": ..., "rows": [...]}`
 を返す(rows が従来の配列)。
 
+## カウントの仕様(サマリ)
+
+- **Drafts はサイドバーの件数との一致が正。** `drafts.list` の生の結果には
+  サイドバーに出ない「幽霊 draft」が混ざるため、以下を除外して数える:
+  送信済み・削除済み / 宛先チャンネルがアーカイブ済み・削除済み
+  (`channel_not_found`) / 親スレッドが消えたスレッド宛(`thread_not_found`)。
+  隠すのは API が「存在しない」と確定回答したときだけで、一時エラーは
+  表示扱いに倒す(実在する draft を隠さない)。
+- **Later の ✓ CLEAR 閾値**は workspace ごとに `web.py` の
+  `LATER_CLEAR_THRESHOLD`(domain キー、デフォルト 3)で設定。
+- キャッシュ TTL は 600 秒 = ページ自動リロード間隔(揃えてあるのは意図的)。
+  force sync は `POST /refresh` で、失敗しても直前の正常キャッシュを保持。
+
+経緯・設計判断の詳細は [`docs/adr/`](docs/adr/) を参照。
+
 ## ファイル
 
 - `fetch_counts.py` — 各 workspace の3つの count を並列取得、JSON 出力もできる (`python3 fetch_counts.py`)
