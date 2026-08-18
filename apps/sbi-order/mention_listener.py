@@ -144,6 +144,14 @@ def handle_event(headers, raw_body, bot_user_id, on_command, on_clear_all, on_bo
     if event.get("type") != "app_mention" or event.get("bot_id"):
         return 200, b"ok"
 
+    # 受信の合図として、権限・書式チェックの前にまずメンションへ👀を付ける。
+    # リアクションは補助なので、失敗しても（reactions:write 未付与等）本処理は続ける。
+    try:
+        import slack_client
+        slack_client.react(event.get("channel"), event.get("ts"), "eyes")
+    except Exception:
+        pass
+
     user = event.get("user")
     channel = event.get("channel")
     thread_ts = event.get("thread_ts") or event.get("ts")

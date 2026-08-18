@@ -49,6 +49,31 @@ def post(channel, text, thread_ts=None):
         raise RuntimeError(f"chat.postMessage failed: {resp.get('error')}")
 
 
+def react(channel, ts, name="eyes"):
+    """メッセージに絵文字リアクションを付ける (reactions.add)。
+
+    bot に reactions:write スコープが必要（slack-app-manifest.json 参照）。
+    """
+    token = _bot_token()
+    if not token:
+        raise RuntimeError(
+            f"Slack bot token がありません。{BOT_TOKEN_PATH} に置くか"
+            " SLACK_BOT_TOKEN を設定してください。"
+        )
+    req = urllib.request.Request(
+        "https://slack.com/api/reactions.add",
+        data=json.dumps({"channel": channel, "timestamp": ts, "name": name}).encode(),
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json; charset=utf-8",
+        },
+    )
+    with urllib.request.urlopen(req, timeout=15) as r:
+        resp = json.loads(r.read())
+    if not resp.get("ok") and resp.get("error") != "already_reacted":
+        raise RuntimeError(f"reactions.add failed: {resp.get('error')}")
+
+
 def bot_user_id():
     token = _bot_token()
     if not token:
