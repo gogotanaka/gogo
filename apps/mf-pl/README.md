@@ -49,8 +49,39 @@ python3 fetch_pl.py --profile <新プロファイル名> --check   # 会社名�
 ```
 
 以降 `./run.sh` が自動で全プロファイルを回す。会社名はAPIから取得するので設定不要。
-別テナントで同じ連携用アプリが使えない場合は、その会社のアプリポータルでアプリを登録し、
-`oauth_client-<profile>.json` に Client ID/Secret を置く。
+
+**`--check` は必ず実行すること。** 認可画面は事業者を選ぶUIなので、選び間違えると
+別の会社のトークンがそのプロファイル名で保存され、集計時に同じ会社が二重計上される
+（実際に一度起きた）。違っていたら `sqlite3 config/tokens.db "DELETE FROM tokens WHERE profile='<名前>'"`
+で消してから認可し直す。
+
+### リダイレクトURIの制約（重要）
+
+**MF はリダイレクトURIに `http://` を受け付けない**（`https` 必須）。`http://localhost:8384/callback`
+はアプリポータルで保存自体はできるが、`/authorize` が HTTP 400 を返す（`localhost` /
+`127.0.0.1` / 末尾スラッシュ有無すべて不可）。そのためローカルで認可を通すにも
+**https のトンネルが要る**：
+
+```sh
+cloudflared tunnel --url http://localhost:8384          # 出力の https://xxx.trycloudflare.com を控える
+# → アプリポータルでそのURL + /callback をリダイレクトURIに登録（「追加」で複数登録可）
+# → oauth_client*.json の redirect_uri に同じ値を書き、local_port: 8384 を添える
+python3 auth.py <profile>
+```
+
+trycloudflare の quick tunnel はホスト名が毎回変わるので、**認可のたびにポータルへの
+登録が必要**。認可さえ通ればリフレッシュトークン（540日）で回るのでトンネルは不要になる。
+頻繁に会社を足すなら名前付きトンネル＋独自ドメインで固定URLにするとこの手間が消える。
+
+### 別アプリが必要になる場合
+
+会社によっては共通の連携用アプリを使えず（アプリポータルはMFID/事業者ごと）、その会社の
+アプリポータルで新規にアプリを登録することになる。その場合は Client ID/Secret を
+`config/oauth_client-<profile>.json` に置けば共通設定より優先される。1つのアプリで複数の
+会社を認可できることもあるので（認可画面の事業者リストに出れば可）、まず既存アプリで
+試すとよい。
+
+アプリポータル: https://app-portal.moneyforward.com/apps/
 
 ## セットアップの経緯・APIメモ
 
@@ -62,7 +93,11 @@ python3 fetch_pl.py --profile <新プロファイル名> --check   # 会社名�
 - アクセストークン1時間、リフレッシュトークン540日 → 初回認可後は無人運用可
 - PL/BS: `GET https://api-accounting.moneyforward.com/api/v3/reports/trial_balance_{pl,bs}?start_date=…&end_date=…`
 - レスポンスは階層 rows。values は `[前期残高, 借方, 貸方, 期末残高, 構成比]` 固定。
-  単月指定なら PL は期末残高=当月発生額、BS は期末残高=月末時点残高
+  **PL の期末残高は単月指定でも期首からの累計**なので、当月発生額 = 期末残高 − 前期残高
+  （`format_pl.amount()`。月次推移表 transition_pl の当月列と一致を確認済み）。
+  BS は期末残高がそのまま月末時点残高。構成比も PL は累計ベースなので当月売上高で再計算する
+- **締めていない月は数値が壊れて見える**（売上高や負債がマイナスになる等）。
+  当月・進行中の月ではなく、締んだ月を指定すること
 - 金額0の科目と一部の決算書項目は返却されない。常に全部門合計
 - Slack bot（awsm workspace, scope: chat:write のみ）は招待済みチャンネルにしか投稿できない。
   CDP フォールバックは Slack を勝手に再起動しない（過去の launchd 問題のため）
