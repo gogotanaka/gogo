@@ -211,6 +211,12 @@ def _poll_orders(client):
                 _announce_fill(order)
             elif status == "cancelled":
                 order_store.update_order(order["id"], status="cancelled")
+            elif status == "unknown":
+                # 注文照会一覧に見つからない = 何らかの理由（このアプリの外で
+                # 手動取消した等）で追跡対象から外れている。「submitted」の
+                # まま残すと毎回チェックし続けてしまう（過度な遷移の原因になった
+                # 実績あり、docs/adr/0011）ため、追跡を打ち切る。
+                order_store.update_order(order["id"], status="unknown")
         except HumanInterventionRequired as e:
             _alert_login_needed(str(e))
             return  # ログインが必要なら残りの注文チェックも今回はスキップ
