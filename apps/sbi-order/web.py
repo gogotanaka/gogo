@@ -231,15 +231,47 @@ def _poll_price(client):
         print(f"[price] 板情報取得に失敗しました: {e}", file=sys.stderr)
 
 
+def _connect_with_retry():
+    """ブラウザへの接続を失敗しても諦めずリトライする。
+
+    以前は SBIClient().start() の失敗（例: CDP接続タイムアウト）が _sbi_loop
+    スレッド全体を無言で落としていた。その場合HTTPサーバ自体は動き続ける
+    ため、メンションは「受け付けました」と返信されるのに実際には何も処理
+    されない（Slack通知も一切来ない）という気づきにくい壊れ方をしていた。
+    それを防ぐため、接続できるまでここでリトライし続ける。
+    """
+    attempt = 0
+    while True:
+        attempt += 1
+        try:
+            return SBIClient().start()
+        except HumanInterventionRequired as e:
+            if attempt == 1 or attempt % 5 == 0:
+                _alert_login_needed(str(e))
+            print(
+                f"[startup] ブラウザ接続に失敗（{attempt}回目）。10秒後に再試行します: {e}",
+                file=sys.stderr,
+            )
+        except Exception as e:
+            print(
+                f"[startup] ブラウザ接続で想定外のエラー（{attempt}回目）。"
+                f"10秒後に再試行します: {e}",
+                file=sys.stderr,
+            )
+        time.sleep(10)
+
+
 def _sbi_loop():
     """SBI/ブラウザに触る唯一のスレッド。発注キューの処理・約定確認・株価投稿を
     このスレッドの中で順番に行う（Playwrightの同期APIはスレッドを跨げないため）。
+    このスレッドが例外で落ちると何も処理されなくなる（HTTPサーバ自体は動き
+    続けるため気づきにくい）ため、ループ内は必ず捕捉して継続する。
     """
     watch_price = bool(WATCH_TICKERS and SLACK_CHANNEL)
     if WATCH_TICKERS and not SLACK_CHANNEL:
         print("[price] SLACK_CHANNEL が未設定のため株価監視は行いません", file=sys.stderr)
 
-    client = SBIClient().start()
+    client = _connect_with_retry()
     try:
         client.ensure_logged_in()
         _clear_login_alert()
@@ -263,15 +295,21 @@ def _sbi_loop():
                 _process_clear_all(client, item[1], item[2])
         except queue.Empty:
             pass
+        except Exception as e:
+            print(f"[sbi_loop] キュー処理で想定外のエラー: {e}", file=sys.stderr)
 
-        now = time.monotonic()
-        if now >= next_order_poll:
-            _poll_orders(client)
-            next_order_poll = now + POLL_INTERVAL_SEC
-        if watch_price and now >= next_price_poll:
-            if _is_market_hours():
-                _poll_price(client)
-            next_price_poll = now + random.uniform(PRICE_INTERVAL_MIN_SEC, PRICE_INTERVAL_MAX_SEC)
+        try:
+            now = time.monotonic()
+            if now >= next_order_poll:
+                _poll_orders(client)
+                next_order_poll = now + POLL_INTERVAL_SEC
+            if watch_price and now >= next_price_poll:
+                if _is_market_hours():
+                    _poll_price(client)
+                next_price_poll = now + random.uniform(
+                    PRICE_INTERVAL_MIN_SEC, PRICE_INTERVAL_MAX_SEC)
+        except Exception as e:
+            print(f"[sbi_loop] ポーリングで想定外のエラー: {e}", file=sys.stderr)
 
 
 # --- HTML ---

@@ -79,7 +79,35 @@ class SBIClient:
 
     # --- login ---
 
+    def _page_is_alive(self):
+        """タブがクラッシュ（Aw, Snap!／Target crashed）していないか確認する。"""
+        try:
+            self.page.evaluate("1", timeout=2000)
+            return True
+        except Exception:
+            return False
+
+    def _recover_crashed_page(self):
+        """クラッシュしたタブを、同じブラウザ（＝同じログインセッション）内の
+        新しいタブに差し替える。連続操作でタブがクラッシュした場合、直さないと
+        以後の全操作が同じエラーで無限に失敗し続けてしまうため、自動復旧する。
+        """
+        try:
+            new_page = self._context.new_page()
+        except Exception as e:
+            raise HumanInterventionRequired(
+                f"ブラウザのタブがクラッシュし、新しいタブも開けませんでした。"
+                f"手動でブラウザを確認してください: {e}"
+            )
+        try:
+            self.page.close()
+        except Exception:
+            pass  # クラッシュ済みのタブなのでclose自体が失敗しても無視してよい
+        self.page = new_page
+
     def ensure_logged_in(self):
+        if not self._page_is_alive():
+            self._recover_crashed_page()
         if "sbisec.co.jp" not in self.page.url:
             self.page.goto(LOGIN_URL, wait_until="domcontentloaded")
         if self._is_logged_in():
