@@ -21,8 +21,8 @@ ID・パスワードでの自動再ログインを試みる（`docs/adr/0012`）
 場合は、Slackで人（`SLACK_MENTION_USER`）にメンションして知らせるので、その人が
 普段のブラウザで続きを行う（OTP入力、またはパスキーでの再ログイン）。
 
-設計の背景・調査した規制まわりの話は [docs/adr/0001-sbi-order-automation.md](../../docs/adr/0001-sbi-order-automation.md) と
-[docs/adr/0003-sbi-order-cdp-attach.md](../../docs/adr/0003-sbi-order-cdp-attach.md) 参照。
+設計の背景・調査した規制まわりの話は [docs/adr/0001-sbi-order-automation.md](docs/adr/0001-sbi-order-automation.md) と
+[docs/adr/0003-sbi-order-cdp-attach.md](docs/adr/0003-sbi-order-cdp-attach.md) 参照。
 
 ## 前提として承知しておくこと
 
@@ -101,7 +101,8 @@ echo "xoxb-..." > config/slack_bot_token
 
 `@bot book` で、板情報（気配値）をその場で取得してスレッドに投稿する（定期投稿を
 待たずに済む）。対象は `SBI_WATCH_TICKERS` の全銘柄。`@bot book 3930` のように銘柄
-コードを指定すれば、その銘柄だけを投稿する。
+コードを指定すれば、その銘柄だけを投稿する。板情報には本日の出来高（株数）も
+あわせて表示する（`docs/adr/0013`）。
 
 最初はSocket Modeで実装したが、接続自体はできるのに `app_mention` イベントが実際には
 配送されない現象が解消できず、HTTP Request URL方式（Slackがこのアプリの
