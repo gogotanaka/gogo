@@ -22,6 +22,8 @@
 そのChromeでSBIに（パスキーで）ログインしておけば、このクライアントがそのタブに
 接続して以降の操作を行う。
 """
+import re
+
 from playwright.sync_api import sync_playwright
 
 from config import ENV
@@ -293,26 +295,60 @@ class SBIClient:
         self._click_visible_text("注文照会")
         self.page.wait_for_load_state("domcontentloaded")
 
+    def read_order_table(self):
+        """注文照会の全論理行を構造化して返す。
+
+        戻り値: [{'order_id': str, 'status': str, 'qty': int|None, 'unfilled': int|None}]
+        （qty/unfilled が読めなければ None。約定株数 = qty - unfilled。）
+
+        1論理行は2つの<tr>にまたがる（実画面のダンプで確認済み、2026-08-20）:
+          1つ目: 注文番号(rowspan=2) / 注文状況 / 注文種別 / 銘柄 / 利用ポイント / 取消訂正 / 関連番号
+          2つ目: 取引・預り / 注文日・期間 / 注文株数（未約定）例 '600 (600)' / 執行条件 / 注文単価
+        外側テーブルの querySelectorAll は入れ子の同じ<tr>要素を重複して返さない
+        （locatorは要素単位でユニーク）ため、文書順で「注文番号の行→直後の詳細行」
+        のペアとして読める。
+        """
+        self._open_order_inquiry()
+        rows = self.page.locator("table tr").all()
+        orders = []
+        i = 0
+        while i < len(rows):
+            cells = rows[i].locator("td").all()
+            head = []
+            for c in cells[:2]:
+                try:
+                    head.append(c.inner_text(timeout=300).strip())
+                except Exception:
+                    head.append("")
+            if len(head) == 2 and head[0].isdigit() and any(
+                    k in head[1] for k in ("注文", "約定", "取消", "失効", "待機")):
+                entry = {"order_id": head[0], "status": head[1],
+                         "qty": None, "unfilled": None}
+                if i + 1 < len(rows):
+                    detail = rows[i + 1].locator("td").all()
+                    if len(detail) >= 3:
+                        try:
+                            text = detail[2].inner_text(timeout=300).strip()
+                            m = re.match(r"([\d,]+)\s*[（(]([\d,]+)[)）]", text)
+                            if m:
+                                entry["qty"] = int(m.group(1).replace(",", ""))
+                                entry["unfilled"] = int(m.group(2).replace(",", ""))
+                        except Exception:
+                            pass
+                orders.append(entry)
+                i += 2
+                continue
+            i += 1
+        return orders
+
     def list_pending_order_ids(self):
         """現在「注文中」（未約定・未取消）の全注文番号を返す。
 
-        rowspanで1論理行が複数<tr>にまたがる構造のため、tr単位でtd[0]が数字
-        （注文番号）かつtd[1]が「注文中」の行だけを拾う（実画面で確認済み）。
+        判定基準（td[0]が数字の注文番号・td[1]が「注文中」）は従来のまま
+        （実画面で確認済み）。read_order_table() の絞り込みとして実装する。
         """
-        self._open_order_inquiry()
-        order_ids = []
-        for row in self.page.locator("table tr").all():
-            cells = row.locator("td").all()
-            if len(cells) < 2:
-                continue
-            try:
-                order_id = cells[0].inner_text(timeout=300).strip()
-                status = cells[1].inner_text(timeout=300).strip()
-            except Exception:
-                continue
-            if order_id.isdigit() and status == "注文中":
-                order_ids.append(order_id)
-        return order_ids
+        return [o["order_id"] for o in self.read_order_table()
+                if o["status"] == "注文中"]
 
     def cancel_order(self, sbi_order_id):
         """指定注文番号を取消する。取消完了（受付済み）を確認できなければ

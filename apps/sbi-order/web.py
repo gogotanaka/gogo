@@ -20,6 +20,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import mention_listener
 import notify
 import order_store
+import rebid_session
 import slack_client
 from config import ENV
 from sbi_client import HumanInterventionRequired, SBIClient, format_order_book
@@ -27,27 +28,23 @@ from sbi_client import HumanInterventionRequired, SBIClient, format_order_book
 PORT = 8381
 _BOT_USER_ID = None  # main()で解決。メンション本文から自分宛の<@ID>を取り除くのに使う。
 POLL_INTERVAL_SEC = 60
-# 株価取得の間隔は固定にせず、機械的なアクセスパターンにならないよう毎回この範囲でランダムに決める。
-PRICE_INTERVAL_MIN_SEC = int(ENV.get("SBI_PRICE_INTERVAL_MIN_SEC", "480"))  # 8分
-PRICE_INTERVAL_MAX_SEC = int(ENV.get("SBI_PRICE_INTERVAL_MAX_SEC", "720"))  # 12分
+# 板情報の定期投稿: 相場が開く日の8:00から、時計に揃えた固定間隔（既定10分毎:
+# 8:00, 8:10, ...）で SLACK_MENTION_USER 宛メンション付きで投稿する。
+PRICE_POST_INTERVAL_SEC = int(ENV.get("SBI_PRICE_POST_INTERVAL_SEC", "600"))
 WATCH_TICKERS = [t.strip() for t in ENV.get("SBI_WATCH_TICKERS", "").split(",") if t.strip()]
 SLACK_CHANNEL = ENV.get("SLACK_CHANNEL", "")
 SLACK_MENTION_USER = ENV.get("SLACK_MENTION_USER", "")
 # メンション経由の注文への安全弁: 見積金額がこれを超えたら発注せず拒否する。
 MAX_ORDER_VALUE_YEN = float(ENV.get("SBI_MAX_ORDER_VALUE_YEN", "500000"))
 
-# 自動リビッド: 有効時（SBI_AUTO_REBID_TICKER設定時）、ランダム間隔で未約定注文を
-# 全取消し、最良買気配と同値の買い指値を入れ直す。間隔・数量を固定にしないのは
-# 株価取得と同じく機械的なパターンを避けるため。
-AUTO_REBID_TICKER = ENV.get("SBI_AUTO_REBID_TICKER", "")
-AUTO_REBID_INTERVAL_MIN_SEC = int(ENV.get("SBI_AUTO_REBID_INTERVAL_MIN_SEC", "1200"))  # 20分
-AUTO_REBID_INTERVAL_MAX_SEC = int(ENV.get("SBI_AUTO_REBID_INTERVAL_MAX_SEC", "1800"))  # 30分
-AUTO_REBID_QTY_MIN = int(ENV.get("SBI_AUTO_REBID_QTY_MIN", "300"))
-AUTO_REBID_QTY_MAX = int(ENV.get("SBI_AUTO_REBID_QTY_MAX", "600"))
-AUTO_REBID_QTY_STEP = int(ENV.get("SBI_AUTO_REBID_QTY_STEP", "100"))  # 3930の売買単位
-# 発注する価格の上限（円）。最良買気配がこれを超えている間は発注を見送り、
-# 超えた最初の回だけメンションで知らせる。0/未設定なら制限なし。
-AUTO_REBID_MAX_PRICE_YEN = float(ENV.get("SBI_AUTO_REBID_MAX_PRICE_YEN", "0") or 0)
+# リビッドセッション（`start 銘柄 合計株数 上限価格` メンションで開始、`stop` で停止）:
+# 営業日の8:59（寄り付き直前）に初回、以降は場中この間隔（ランダム）で
+# 「未約定注文を全取消→最良買気配と同値で残量の買い指値」を繰り返す。
+# 間隔を固定にしないのは機械的なアクセスパターンを避けるため。
+REBID_START_TIME = dt_time(8, 59)
+REBID_INTERVAL_MIN_SEC = int(ENV.get("SBI_REBID_INTERVAL_MIN_SEC", "1200"))  # 20分
+REBID_INTERVAL_MAX_SEC = int(ENV.get("SBI_REBID_INTERVAL_MAX_SEC", "1800"))  # 30分
+REBID_LOT_SIZE = int(ENV.get("SBI_REBID_LOT_SIZE", "100"))  # 売買単位
 
 JST = timezone(timedelta(hours=9))
 
@@ -185,6 +182,43 @@ def _on_clear_all(channel, thread_ts, reply):
     _work_q.put(("clear_all", channel, thread_ts))
 
 
+def _on_start(parsed, channel, thread_ts, reply):
+    """`start 銘柄 合計株数 上限価格` メンションの入口（HTTPリクエストのスレッド）。
+    セッションファイルとキューだけを操作し、Playwrightには触らない。
+    """
+    global _rebid_price_alerted
+    prev = rebid_session.load()
+    rebid_session.start(parsed["ticker"], parsed["target_qty"], parsed["price_cap"])
+    _rebid_price_alerted = False
+    replaced = (
+        f"（実行中だったセッション {prev['ticker']} {prev['target_qty']}株を置き換え）"
+        if prev else ""
+    )
+    reply(
+        f"リビッドセッション開始{replaced}: {parsed['ticker']} を"
+        f"上限{parsed['price_cap']:,.0f}円で合計{parsed['target_qty']}株。"
+        f"営業日の8:59〜場中に約{REBID_INTERVAL_MIN_SEC // 60}〜"
+        f"{REBID_INTERVAL_MAX_SEC // 60}分おきに未約定注文を全取消→"
+        f"最良買気配へ残量の買い指値を出します。`stop` で停止。"
+    )
+    _work_q.put(("session_kick",))
+
+
+def _on_stop(channel, thread_ts, reply):
+    """`stop` メンションの入口（HTTPリクエストのスレッド）。"""
+    sess = rebid_session.load()
+    if not sess:
+        reply("実行中のリビッドセッションはありません。")
+        return
+    bought = rebid_session.total_filled(sess)
+    rebid_session.clear()
+    reply(
+        f"リビッドセッションを停止しました"
+        f"（{sess['ticker']} 買付済み {bought}/{sess['target_qty']}株）。"
+        f"未約定の注文はそのまま残ります（消すには `clear all`）。"
+    )
+
+
 def _on_book_request(ticker, channel, thread_ts, reply):
     """`book`/`book 3930` メンションを受けたときの入口（HTTPリクエストのスレッド
     から呼ばれる）。Playwrightには一切触らず、キューに積むだけ。
@@ -262,6 +296,8 @@ def _poll_orders(client):
             if status == "filled":
                 order_store.update_order(
                     order["id"], status="filled", filled_at=_now(), notified_at=_now())
+                # リビッドセッション中の注文なら、買付済み株数にも反映する
+                rebid_session.record_fill(order["sbi_order_id"], order["qty"])
                 _announce_fill(order)
             elif status == "cancelled":
                 order_store.update_order(order["id"], status="cancelled")
@@ -279,104 +315,138 @@ def _poll_orders(client):
 
 
 def _poll_price(client):
+    mention = f"<@{SLACK_MENTION_USER}> " if SLACK_MENTION_USER else ""
     try:
         client.ensure_logged_in()
         _clear_login_alert()
         for ticker in WATCH_TICKERS:
             book = client.get_order_book(ticker)
-            slack_client.post(SLACK_CHANNEL, format_order_book(ticker, book))
+            slack_client.post(SLACK_CHANNEL, mention + format_order_book(ticker, book))
     except HumanInterventionRequired as e:
         _alert_login_needed(str(e))
     except Exception as e:
         print(f"[price] 板情報取得に失敗しました: {e}", file=sys.stderr)
 
 
-def _auto_rebid(client):
-    """未約定の注文を全取消し、最良買気配と同値の買い指値を入れ直す。
-
-    数量は AUTO_REBID_QTY_MIN〜MAX からランダム（STEP刻み）。見積が
-    MAX_ORDER_VALUE_YEN を超える場合は超えない数量まで下げ、最小数量でも
-    超えるなら今回は見送る。結果は毎回 SLACK_MENTION_USER 宛のメンションで報告する。
-    発注はorder_storeにも記録するので、約定は既存の60秒ポーラーが検知・通知する。
-    """
+def _rebid_report(text):
     mention = f"<@{SLACK_MENTION_USER}> " if SLACK_MENTION_USER else ""
+    notify.notify("SBIリビッド", text)
+    if SLACK_CHANNEL:
+        try:
+            slack_client.post(SLACK_CHANNEL, f"{mention}リビッド: {text}")
+        except Exception as e:
+            print(f"[rebid] Slack投稿に失敗しました: {e}", file=sys.stderr)
 
-    def report(text):
-        notify.notify("SBI自動リビッド", text)
-        if SLACK_CHANNEL:
-            try:
-                slack_client.post(SLACK_CHANNEL, f"{mention}自動リビッド: {text}")
-            except Exception as e:
-                print(f"[rebid] Slack投稿に失敗しました: {e}", file=sys.stderr)
 
+def _best_numeric_bid(client, ticker):
+    """最良買気配の価格を float で返す。板は価格の降順なので、価格が数値で
+    買数量がある最初の行が最良買気配。OVER/UNDER/成行の行は指値に使えないので
+    飛ばす。読めなければ None。"""
+    for row in client.get_order_book(ticker)["rows"]:
+        if not row["bid_qty"]:
+            continue
+        try:
+            return float(row["price"])
+        except ValueError:
+            continue
+    return None
+
+
+def _session_rebid(client):
+    """リビッドセッションの1ティック。
+
+    1. 最良買気配を確認。セッションの上限価格を超えていれば、既存注文には
+       触らず見送る（通知は超えた最初の回だけ）
+    2. 注文照会を読み、セッション注文の約定株数（部分約定含む）を反映
+    3. 未約定の注文を全取消（セッション外の注文も含む）→ 取消後に再読みして
+       取消までに入った約定を確定
+    4. 残量（目標 − 買付済み）を売買単位に切り捨てて発注。目標到達なら
+       セッションを終了して報告
+
+    結果は毎回 SLACK_MENTION_USER 宛のメンションで報告する。発注は
+    order_store にも記録するので、全部約定は既存の60秒ポーラーも検知・通知する。
+    """
+    sess = rebid_session.load()
+    if not sess:
+        return
     global _rebid_price_alerted
     try:
         client.ensure_logged_in()
         _clear_login_alert()
 
-        # 板は価格の降順なので、価格が数値で買数量がある最初の行が最良買気配。
-        # OVER/UNDER/成行の行は指値に使えないので飛ばす。
-        bid = None
-        for row in client.get_order_book(AUTO_REBID_TICKER)["rows"]:
-            if not row["bid_qty"]:
-                continue
-            try:
-                bid = float(row["price"])
-                break
-            except ValueError:
-                continue
+        bid = _best_numeric_bid(client, sess["ticker"])
         if bid is None:
-            report("最良買気配が取れなかったため、今回は何もしませんでした")
+            _rebid_report("最良買気配が取れなかったため、今回は何もしませんでした")
             return
 
         # 価格上限: 超えている間は既存注文に触らず見送る。通知は超えた最初の回だけ。
-        if AUTO_REBID_MAX_PRICE_YEN and bid > AUTO_REBID_MAX_PRICE_YEN:
+        if bid > sess["price_cap"]:
             if not _rebid_price_alerted:
                 _rebid_price_alerted = True
-                report(
-                    f"最良買気配が上限({AUTO_REBID_MAX_PRICE_YEN:,.0f}円)を超えました"
+                _rebid_report(
+                    f"最良買気配が上限({sess['price_cap']:,.0f}円)を超えました"
                     f"（現在 {bid}円）。上限以下に戻るまで発注を見送ります"
                     f"（この通知は繰り返しません）")
             return
         _rebid_price_alerted = False
 
+        rows = client.read_order_table()
+        rebid_session.update_fills_from_rows(rows)
         cancelled = []
-        for sbi_order_id in client.list_pending_order_ids():
-            client.cancel_order(sbi_order_id)
-            order_store.update_order_by_sbi_id(sbi_order_id, status="cancelled")
-            cancelled.append(sbi_order_id)
+        for row in rows:
+            if row["status"] != "注文中":
+                continue
+            client.cancel_order(row["order_id"])
+            order_store.update_order_by_sbi_id(row["order_id"], status="cancelled")
+            cancelled.append(row["order_id"])
+        if cancelled:
+            # 取消の直前まで部分約定が入りうるので、取消後の確定値で数え直す
+            rebid_session.update_fills_from_rows(client.read_order_table())
         cancelled_note = f"注文{', '.join(cancelled)}を取消 → " if cancelled else ""
 
-        qty = random.randrange(
-            AUTO_REBID_QTY_MIN, AUTO_REBID_QTY_MAX + 1, AUTO_REBID_QTY_STEP)
+        sess = rebid_session.load()
+        if not sess:
+            return
+        bought = rebid_session.total_filled(sess)
+        remaining = sess["target_qty"] - bought
+        remaining -= remaining % REBID_LOT_SIZE  # 売買単位に切り捨て
+        if remaining <= 0:
+            _rebid_report(
+                f"{cancelled_note}目標に到達しました"
+                f"（買付済み {bought}/{sess['target_qty']}株）。セッションを終了します")
+            rebid_session.clear()
+            return
+
         # 安全弁（SBI_MAX_ORDER_VALUE_YEN）は自動発注にも適用する。
-        # 上限内に収まるまで数量を下げるが、下限（QTY_MIN）を割ってまでは発注しない。
-        while qty > AUTO_REBID_QTY_MIN and qty * bid > MAX_ORDER_VALUE_YEN:
-            qty -= AUTO_REBID_QTY_STEP
+        # 上限内に収まるまで数量を下げるが、売買単位を割ってまでは発注しない。
+        qty = remaining
+        while qty > REBID_LOT_SIZE and qty * bid > MAX_ORDER_VALUE_YEN:
+            qty -= REBID_LOT_SIZE
         if qty * bid > MAX_ORDER_VALUE_YEN:
-            report(
-                f"{cancelled_note}最小数量({AUTO_REBID_QTY_MIN}株)でも見積が"
+            _rebid_report(
+                f"{cancelled_note}最小数量({REBID_LOT_SIZE}株)でも見積が"
                 f"上限({MAX_ORDER_VALUE_YEN:,.0f}円)を超えるため見送りました"
                 f"（最良買気配 {bid}円）")
             return
 
-        order_id = order_store.create_order(AUTO_REBID_TICKER, "buy", qty, bid)
+        order_id = order_store.create_order(sess["ticker"], "buy", qty, bid)
         try:
-            sbi_order_id = client.place_order(AUTO_REBID_TICKER, "buy", qty, bid)
+            sbi_order_id = client.place_order(sess["ticker"], "buy", qty, bid)
         except Exception:
             order_store.update_order(order_id, status="error")
             raise
         order_store.update_order(
             order_id, status="submitted", sbi_order_id=sbi_order_id,
             submitted_at=_now())
-        report(
-            f"{cancelled_note}{AUTO_REBID_TICKER} 買 {qty}株 @ {bid}円"
-            f" (注文番号{sbi_order_id})")
+        rebid_session.add_order(sbi_order_id, qty)
+        _rebid_report(
+            f"{cancelled_note}{sess['ticker']} 買 {qty}株 @ {bid}円"
+            f" (注文番号{sbi_order_id}) — 買付済み {bought}/{sess['target_qty']}株")
     except HumanInterventionRequired as e:
         _alert_login_needed(str(e))
-        report(f"実行できませんでした（要対応）: {e}")
+        _rebid_report(f"実行できませんでした（要対応）: {e}")
     except Exception as e:
-        report(f"実行に失敗しました: {e}")
+        _rebid_report(f"実行に失敗しました: {e}")
 
 
 def _connect_with_retry():
@@ -429,12 +499,23 @@ def _sbi_loop():
         print(f"[startup] 起動時ログインに失敗しました: {e}", file=sys.stderr)
 
     next_order_poll = time.monotonic() + POLL_INTERVAL_SEC
-    next_price_poll = (
-        time.monotonic() + random.uniform(PRICE_INTERVAL_MIN_SEC, PRICE_INTERVAL_MAX_SEC)
-        if watch_price else None
-    )
-    # 自動リビッドの初回は起動直後（15秒後）。以降はランダム間隔。
-    next_rebid = time.monotonic() + 15 if AUTO_REBID_TICKER else None
+    # 板情報の定期投稿は時計に揃えたスロット（既定600秒 = 8:00, 8:10, ...）。
+    # 起動直後の場中は前のスロット扱いで1回すぐ投稿される。
+    last_price_slot = None
+    # リビッドセッション: 各営業日の初回ティックは8:59以降の最初のループで即実行。
+    # 以降はランダム間隔。`start` 受信時は session_kick でその場で1回実行する。
+    next_rebid = 0.0
+    rebid_tick_date = None
+
+    def _run_rebid_tick():
+        nonlocal next_rebid, rebid_tick_date
+        rebid_tick_date = datetime.now(JST).date()
+        _session_rebid(client)
+        next_rebid = time.monotonic() + random.uniform(
+            REBID_INTERVAL_MIN_SEC, REBID_INTERVAL_MAX_SEC)
+
+    def _rebid_window_open(now_jst):
+        return _is_market_hours(now_jst) and now_jst.time() >= REBID_START_TIME
 
     while True:
         try:
@@ -445,6 +526,10 @@ def _sbi_loop():
                 _process_clear_all(client, item[1], item[2])
             elif item[0] == "book":
                 _process_book_request(client, item[1], item[2], item[3])
+            elif item[0] == "session_kick":
+                # `start` 直後の1回。場外・8:59前なら何もしない（定期側が拾う）
+                if rebid_session.exists() and _rebid_window_open(datetime.now(JST)):
+                    _run_rebid_tick()
         except queue.Empty:
             pass
         except Exception as e:
@@ -455,16 +540,16 @@ def _sbi_loop():
             if now >= next_order_poll:
                 _poll_orders(client)
                 next_order_poll = now + POLL_INTERVAL_SEC
-            if watch_price and now >= next_price_poll:
-                if _is_market_hours():
+            if watch_price:
+                slot = int(time.time() // PRICE_POST_INTERVAL_SEC)
+                if slot != last_price_slot and _is_market_hours():
+                    last_price_slot = slot
                     _poll_price(client)
-                next_price_poll = now + random.uniform(
-                    PRICE_INTERVAL_MIN_SEC, PRICE_INTERVAL_MAX_SEC)
-            if next_rebid is not None and now >= next_rebid:
-                if _is_market_hours():
-                    _auto_rebid(client)
-                next_rebid = now + random.uniform(
-                    AUTO_REBID_INTERVAL_MIN_SEC, AUTO_REBID_INTERVAL_MAX_SEC)
+            if rebid_session.exists():
+                now_jst = datetime.now(JST)
+                if _rebid_window_open(now_jst):
+                    if rebid_tick_date != now_jst.date() or now >= next_rebid:
+                        _run_rebid_tick()
         except Exception as e:
             print(f"[sbi_loop] ポーリングで想定外のエラー: {e}", file=sys.stderr)
 
@@ -544,7 +629,7 @@ class Handler(BaseHTTPRequestHandler):
         print(f"[slack-event] received {length} bytes: {raw_body[:300]!r}", file=sys.stderr)
         status, body = mention_listener.handle_event(
             self.headers, raw_body, _BOT_USER_ID, _on_mention_command, _on_clear_all,
-            _on_book_request)
+            _on_book_request, _on_start, _on_stop)
         print(f"[slack-event] handled -> status={status} body={body[:200]!r}", file=sys.stderr)
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")

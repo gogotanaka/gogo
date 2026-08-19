@@ -40,8 +40,12 @@ _COMMAND_RE = re.compile(
 )
 _CLEAR_ALL_RE = re.compile(r"^\s*clear\s+all\s*$", re.IGNORECASE)
 _BOOK_RE = re.compile(r"^\s*book(?:\s+(\d+))?\s*$", re.IGNORECASE)
+_START_RE = re.compile(r"^\s*start\s+(\d+)\s+(\d+)\s+([\d.]+)\s*$", re.IGNORECASE)
+_STOP_RE = re.compile(r"^\s*stop\s*$", re.IGNORECASE)
 USAGE = (
     "書式が正しくありません。例: `buy 3930 200 742`（buy/sell 銘柄コード 株数 価格）、"
+    "`start 3930 1000 760`（銘柄・合計株数・上限価格を指定してリビッド開始）、"
+    "`stop`（リビッド停止）、"
     "`clear all`（未約定注文を全取消）、`book`（板情報を投稿。`book 3930` で銘柄指定も可）"
 )
 
@@ -85,6 +89,23 @@ def is_clear_all(text, bot_user_id):
     return bool(_CLEAR_ALL_RE.match(_strip_mention(text, bot_user_id)))
 
 
+def parse_start(text, bot_user_id):
+    """`start 3930 1000 760`（銘柄 合計株数 上限価格）を解析する。合わなければ None。"""
+    m = _START_RE.match(_strip_mention(text, bot_user_id))
+    if not m:
+        return None
+    return {
+        "ticker": m.group(1),
+        "target_qty": int(m.group(2)),
+        "price_cap": float(m.group(3)),
+    }
+
+
+def is_stop(text, bot_user_id):
+    """`stop` という厳密な文字列（大文字小文字は無視）かどうか。"""
+    return bool(_STOP_RE.match(_strip_mention(text, bot_user_id)))
+
+
 def parse_book(text, bot_user_id):
     """`book` または `book 3930` を解析する。書式に合わなければ None。
 
@@ -126,13 +147,16 @@ def _react_async(channel, ts):
     threading.Thread(target=_run, daemon=True).start()
 
 
-def handle_event(headers, raw_body, bot_user_id, on_command, on_clear_all, on_book):
+def handle_event(headers, raw_body, bot_user_id, on_command, on_clear_all, on_book,
+                 on_start, on_stop):
     """`/slack/events` へのPOSTを処理する。(status_code, response_body_bytes) を返す。
 
     on_command(parsed, channel, thread_ts, reply) は、書式・権限チェックを通った
     発注コマンドについて呼ばれる。on_clear_all(channel, thread_ts, reply) は
     `clear all` コマンドについて、on_book(ticker, channel, thread_ts, reply) は
     `book`/`book 3930` コマンドについて呼ばれる（tickerは未指定ならNone）。
+    on_start(parsed, channel, thread_ts, reply) は `start 銘柄 合計株数 上限価格`、
+    on_stop(channel, thread_ts, reply) は `stop` について呼ばれる。
     reply(text) はそのスレッドに返信する関数。Slackの3秒タイムアウトに収まるよう、
     いずれも重い処理をせずキューに積むだけにすること。
     """
@@ -177,6 +201,15 @@ def handle_event(headers, raw_body, bot_user_id, on_command, on_clear_all, on_bo
     text = event.get("text", "")
     if is_clear_all(text, bot_user_id):
         on_clear_all(channel, thread_ts, reply)
+        return 200, b"ok"
+
+    started = parse_start(text, bot_user_id)
+    if started is not None:
+        on_start(started, channel, thread_ts, reply)
+        return 200, b"ok"
+
+    if is_stop(text, bot_user_id):
+        on_stop(channel, thread_ts, reply)
         return 200, b"ok"
 
     book = parse_book(text, bot_user_id)
