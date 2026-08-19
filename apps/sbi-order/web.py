@@ -42,8 +42,6 @@ MAX_ORDER_VALUE_YEN = float(ENV.get("SBI_MAX_ORDER_VALUE_YEN", "500000"))
 # 「未約定注文を全取消→最良買気配と同値で残量の買い指値」を繰り返す。
 # 間隔を固定にしないのは機械的なアクセスパターンを避けるため。
 REBID_START_TIME = dt_time(8, 59)
-# `start` コマンドは営業日のこの時間帯（8:59〜9:05、寄り付き前後）だけ受け付ける。
-REBID_START_WINDOW_END = dt_time(9, 5, 59)
 REBID_INTERVAL_MIN_SEC = int(ENV.get("SBI_REBID_INTERVAL_MIN_SEC", "1200"))  # 20分
 REBID_INTERVAL_MAX_SEC = int(ENV.get("SBI_REBID_INTERVAL_MAX_SEC", "1800"))  # 30分
 REBID_LOT_SIZE = int(ENV.get("SBI_REBID_LOT_SIZE", "100"))  # 売買単位
@@ -184,45 +182,58 @@ def _on_clear_all(channel, thread_ts, reply):
     _work_q.put(("clear_all", channel, thread_ts))
 
 
+_WEEKDAY_JA = "月火水木金土日"
+
+
+def _next_rebid_start_date(now_jst):
+    """次の「8:59開始」の日付（JST）。8:59より前なら今日、以降なら翌日。
+    土日はティック側の営業日判定でスキップされるので、ここでは日付だけ進める。"""
+    if now_jst.time() < REBID_START_TIME:
+        return now_jst.date()
+    return (now_jst + timedelta(days=1)).date()
+
+
 def _on_start(parsed, channel, thread_ts, reply):
     """`start 銘柄 合計株数 上限価格` メンションの入口（HTTPリクエストのスレッド）。
-    セッションファイルとキューだけを操作し、Playwrightには触らない。
-    営業日の8:59〜9:05（寄り付き前後）だけ受け付ける。
+    いつでも受け付け、次の営業日8:59開始の予約としてセッションファイルに置く。
+    セッションファイルだけを操作し、Playwrightには触らない。
     """
     global _rebid_price_alerted
     now_jst = datetime.now(JST)
-    if now_jst.weekday() >= 5 or not (
-            REBID_START_TIME <= now_jst.time() <= REBID_START_WINDOW_END):
-        reply(
-            f"`start` は営業日の8:59〜9:05の間だけ受け付けます"
-            f"（現在 {now_jst.strftime('%H:%M')}）。"
-        )
-        return
+    begins_on = _next_rebid_start_date(now_jst)
     prev = rebid_session.load()
-    rebid_session.start(parsed["ticker"], parsed["target_qty"], parsed["price_cap"])
+    rebid_session.start(
+        parsed["ticker"], parsed["target_qty"], parsed["price_cap"],
+        begins_on.isoformat())
     _rebid_price_alerted = False
     replaced = (
-        f"（実行中だったセッション {prev['ticker']} {prev['target_qty']}株を置き換え）"
+        f"（既存セッション {prev['ticker']} {prev['target_qty']}株を置き換え）"
         if prev else ""
     )
     reply(
-        f"リビッドセッション開始{replaced}: {parsed['ticker']} を"
+        f"リビッドセッションを予約しました{replaced}: {parsed['ticker']} を"
         f"上限{parsed['price_cap']:,.0f}円で合計{parsed['target_qty']}株。"
-        f"営業日の8:59〜場中に約{REBID_INTERVAL_MIN_SEC // 60}〜"
-        f"{REBID_INTERVAL_MAX_SEC // 60}分おきに未約定注文を全取消→"
-        f"最良買気配へ残量の買い指値を出します。`stop` で停止。"
+        f"{begins_on.strftime('%m/%d')}"
+        f"({_WEEKDAY_JA[begins_on.weekday()]})の8:59から（土日祝なら翌営業日）、"
+        f"場中に約{REBID_INTERVAL_MIN_SEC // 60}〜{REBID_INTERVAL_MAX_SEC // 60}分"
+        f"おきに未約定注文を全取消→最良買気配へ残量の買い指値を出します。`stop` で停止。"
     )
-    _work_q.put(("session_kick",))
 
 
 def _on_stop(channel, thread_ts, reply):
     """`stop` メンションの入口（HTTPリクエストのスレッド）。"""
     sess = rebid_session.load()
     if not sess:
-        reply("実行中のリビッドセッションはありません。")
+        reply("実行中・予約中のリビッドセッションはありません。")
+        return
+    rebid_session.clear()
+    if sess.get("begins_on", "") > datetime.now(JST).date().isoformat():
+        reply(
+            f"開始前の予約（{sess['ticker']} 合計{sess['target_qty']}株・"
+            f"{sess['begins_on']} 8:59開始）を取り消しました。"
+        )
         return
     bought = rebid_session.total_filled(sess)
-    rebid_session.clear()
     reply(
         f"リビッドセッションを停止しました"
         f"（{sess['ticker']} 買付済み {bought}/{sess['target_qty']}株）。"
@@ -515,8 +526,8 @@ def _sbi_loop():
     # 板情報の定期投稿は時計に揃えたスロット（既定600秒 = 8:00, 8:10, ...）。
     # 起動直後の場中は前のスロット扱いで1回すぐ投稿される。
     last_price_slot = None
-    # リビッドセッション: 各営業日の初回ティックは8:59以降の最初のループで即実行。
-    # 以降はランダム間隔。`start` 受信時は session_kick でその場で1回実行する。
+    # リビッドセッション: begins_on（予約日）以降の各営業日、初回ティックは
+    # 8:59以降の最初のループで即実行。以降はランダム間隔。
     next_rebid = 0.0
     rebid_tick_date = None
 
@@ -539,10 +550,6 @@ def _sbi_loop():
                 _process_clear_all(client, item[1], item[2])
             elif item[0] == "book":
                 _process_book_request(client, item[1], item[2], item[3])
-            elif item[0] == "session_kick":
-                # `start` 直後の1回。場外・8:59前なら何もしない（定期側が拾う）
-                if rebid_session.exists() and _rebid_window_open(datetime.now(JST)):
-                    _run_rebid_tick()
         except queue.Empty:
             pass
         except Exception as e:
@@ -561,8 +568,11 @@ def _sbi_loop():
             if rebid_session.exists():
                 now_jst = datetime.now(JST)
                 if _rebid_window_open(now_jst):
-                    if rebid_tick_date != now_jst.date() or now >= next_rebid:
-                        _run_rebid_tick()
+                    sess = rebid_session.load()
+                    # begins_on（予約日）前はまだ動かさない
+                    if sess and sess.get("begins_on", "") <= now_jst.date().isoformat():
+                        if rebid_tick_date != now_jst.date() or now >= next_rebid:
+                            _run_rebid_tick()
         except Exception as e:
             print(f"[sbi_loop] ポーリングで想定外のエラー: {e}", file=sys.stderr)
 

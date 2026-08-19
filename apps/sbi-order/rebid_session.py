@@ -57,12 +57,16 @@ def exists():
     return os.path.exists(SESSION_PATH)
 
 
-def start(ticker, target_qty, price_cap):
-    """セッションを開始する。既存セッションがあれば置き換える。"""
+def start(ticker, target_qty, price_cap, begins_on):
+    """セッションを予約/開始する。既存セッションがあれば置き換える。
+
+    begins_on: 'YYYY-MM-DD'（JST）。この日以降の営業日8:59からティックが走る。
+    """
     sess = {
         "ticker": str(ticker),
         "target_qty": int(target_qty),
         "price_cap": float(price_cap),
+        "begins_on": str(begins_on),
         "started_at": datetime.now(timezone.utc).isoformat(),
         "orders": {},
     }
