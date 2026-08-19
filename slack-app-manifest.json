@@ -14,7 +14,8 @@
         "scopes": {
             "bot": [
                 "chat:write",
-                "app_mentions:read"
+                "app_mentions:read",
+                "reactions:write"
             ]
         },
         "pkce_enabled": false
