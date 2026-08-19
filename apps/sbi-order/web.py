@@ -45,6 +45,9 @@ AUTO_REBID_INTERVAL_MAX_SEC = int(ENV.get("SBI_AUTO_REBID_INTERVAL_MAX_SEC", "18
 AUTO_REBID_QTY_MIN = int(ENV.get("SBI_AUTO_REBID_QTY_MIN", "300"))
 AUTO_REBID_QTY_MAX = int(ENV.get("SBI_AUTO_REBID_QTY_MAX", "600"))
 AUTO_REBID_QTY_STEP = int(ENV.get("SBI_AUTO_REBID_QTY_STEP", "100"))  # 3930の売買単位
+# 発注する価格の上限（円）。最良買気配がこれを超えている間は発注を見送り、
+# 超えた最初の回だけメンションで知らせる。0/未設定なら制限なし。
+AUTO_REBID_MAX_PRICE_YEN = float(ENV.get("SBI_AUTO_REBID_MAX_PRICE_YEN", "0") or 0)
 
 JST = timezone(timedelta(hours=9))
 
@@ -71,6 +74,9 @@ def _now():
 # 他のスレッド（HTTPサーバ）は queue.Queue 経由でしか関与しない。
 _work_q = queue.Queue()
 _login_alert_sent = False
+# 自動リビッドの価格上限超え通知を出したか。超えている間の連投を防ぎ、
+# 上限以下に戻ったらリセットして次の超過時にまた1回だけ知らせる。
+_rebid_price_alerted = False
 # Slackメンションから来た注文は、結果をそのスレッドにも返信する。
 # order_id -> (channel, thread_ts)。web UI経由の注文はここに登録されないので、
 # _reply_mention_result は何もせず無視するだけになる。
@@ -303,15 +309,10 @@ def _auto_rebid(client):
             except Exception as e:
                 print(f"[rebid] Slack投稿に失敗しました: {e}", file=sys.stderr)
 
+    global _rebid_price_alerted
     try:
         client.ensure_logged_in()
         _clear_login_alert()
-        cancelled = []
-        for sbi_order_id in client.list_pending_order_ids():
-            client.cancel_order(sbi_order_id)
-            order_store.update_order_by_sbi_id(sbi_order_id, status="cancelled")
-            cancelled.append(sbi_order_id)
-        cancelled_note = f"注文{', '.join(cancelled)}を取消 → " if cancelled else ""
 
         # 板は価格の降順なので、価格が数値で買数量がある最初の行が最良買気配。
         # OVER/UNDER/成行の行は指値に使えないので飛ばす。
@@ -325,8 +326,26 @@ def _auto_rebid(client):
             except ValueError:
                 continue
         if bid is None:
-            report(f"{cancelled_note}最良買気配が取れなかったため、今回の発注は見送りました")
+            report("最良買気配が取れなかったため、今回は何もしませんでした")
             return
+
+        # 価格上限: 超えている間は既存注文に触らず見送る。通知は超えた最初の回だけ。
+        if AUTO_REBID_MAX_PRICE_YEN and bid > AUTO_REBID_MAX_PRICE_YEN:
+            if not _rebid_price_alerted:
+                _rebid_price_alerted = True
+                report(
+                    f"最良買気配が上限({AUTO_REBID_MAX_PRICE_YEN:,.0f}円)を超えました"
+                    f"（現在 {bid}円）。上限以下に戻るまで発注を見送ります"
+                    f"（この通知は繰り返しません）")
+            return
+        _rebid_price_alerted = False
+
+        cancelled = []
+        for sbi_order_id in client.list_pending_order_ids():
+            client.cancel_order(sbi_order_id)
+            order_store.update_order_by_sbi_id(sbi_order_id, status="cancelled")
+            cancelled.append(sbi_order_id)
+        cancelled_note = f"注文{', '.join(cancelled)}を取消 → " if cancelled else ""
 
         qty = random.randrange(
             AUTO_REBID_QTY_MIN, AUTO_REBID_QTY_MAX + 1, AUTO_REBID_QTY_STEP)
