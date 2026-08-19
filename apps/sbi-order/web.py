@@ -42,6 +42,8 @@ MAX_ORDER_VALUE_YEN = float(ENV.get("SBI_MAX_ORDER_VALUE_YEN", "500000"))
 # 「未約定注文を全取消→最良買気配と同値で残量の買い指値」を繰り返す。
 # 間隔を固定にしないのは機械的なアクセスパターンを避けるため。
 REBID_START_TIME = dt_time(8, 59)
+# `start` コマンドは営業日のこの時間帯（8:59〜9:05、寄り付き前後）だけ受け付ける。
+REBID_START_WINDOW_END = dt_time(9, 5, 59)
 REBID_INTERVAL_MIN_SEC = int(ENV.get("SBI_REBID_INTERVAL_MIN_SEC", "1200"))  # 20分
 REBID_INTERVAL_MAX_SEC = int(ENV.get("SBI_REBID_INTERVAL_MAX_SEC", "1800"))  # 30分
 REBID_LOT_SIZE = int(ENV.get("SBI_REBID_LOT_SIZE", "100"))  # 売買単位
@@ -185,8 +187,17 @@ def _on_clear_all(channel, thread_ts, reply):
 def _on_start(parsed, channel, thread_ts, reply):
     """`start 銘柄 合計株数 上限価格` メンションの入口（HTTPリクエストのスレッド）。
     セッションファイルとキューだけを操作し、Playwrightには触らない。
+    営業日の8:59〜9:05（寄り付き前後）だけ受け付ける。
     """
     global _rebid_price_alerted
+    now_jst = datetime.now(JST)
+    if now_jst.weekday() >= 5 or not (
+            REBID_START_TIME <= now_jst.time() <= REBID_START_WINDOW_END):
+        reply(
+            f"`start` は営業日の8:59〜9:05の間だけ受け付けます"
+            f"（現在 {now_jst.strftime('%H:%M')}）。"
+        )
+        return
     prev = rebid_session.load()
     rebid_session.start(parsed["ticker"], parsed["target_qty"], parsed["price_cap"])
     _rebid_price_alerted = False
