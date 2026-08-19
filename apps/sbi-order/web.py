@@ -36,6 +36,16 @@ SLACK_MENTION_USER = ENV.get("SLACK_MENTION_USER", "")
 # メンション経由の注文への安全弁: 見積金額がこれを超えたら発注せず拒否する。
 MAX_ORDER_VALUE_YEN = float(ENV.get("SBI_MAX_ORDER_VALUE_YEN", "500000"))
 
+# 自動リビッド: 有効時（SBI_AUTO_REBID_TICKER設定時）、ランダム間隔で未約定注文を
+# 全取消し、最良買気配と同値の買い指値を入れ直す。間隔・数量を固定にしないのは
+# 株価取得と同じく機械的なパターンを避けるため。
+AUTO_REBID_TICKER = ENV.get("SBI_AUTO_REBID_TICKER", "")
+AUTO_REBID_INTERVAL_MIN_SEC = int(ENV.get("SBI_AUTO_REBID_INTERVAL_MIN_SEC", "1200"))  # 20分
+AUTO_REBID_INTERVAL_MAX_SEC = int(ENV.get("SBI_AUTO_REBID_INTERVAL_MAX_SEC", "1800"))  # 30分
+AUTO_REBID_QTY_MIN = int(ENV.get("SBI_AUTO_REBID_QTY_MIN", "300"))
+AUTO_REBID_QTY_MAX = int(ENV.get("SBI_AUTO_REBID_QTY_MAX", "600"))
+AUTO_REBID_QTY_STEP = int(ENV.get("SBI_AUTO_REBID_QTY_STEP", "100"))  # 3930の売買単位
+
 JST = timezone(timedelta(hours=9))
 
 
@@ -275,6 +285,81 @@ def _poll_price(client):
         print(f"[price] 板情報取得に失敗しました: {e}", file=sys.stderr)
 
 
+def _auto_rebid(client):
+    """未約定の注文を全取消し、最良買気配と同値の買い指値を入れ直す。
+
+    数量は AUTO_REBID_QTY_MIN〜MAX からランダム（STEP刻み）。見積が
+    MAX_ORDER_VALUE_YEN を超える場合は超えない数量まで下げ、最小数量でも
+    超えるなら今回は見送る。結果は毎回 SLACK_MENTION_USER 宛のメンションで報告する。
+    発注はorder_storeにも記録するので、約定は既存の60秒ポーラーが検知・通知する。
+    """
+    mention = f"<@{SLACK_MENTION_USER}> " if SLACK_MENTION_USER else ""
+
+    def report(text):
+        notify.notify("SBI自動リビッド", text)
+        if SLACK_CHANNEL:
+            try:
+                slack_client.post(SLACK_CHANNEL, f"{mention}自動リビッド: {text}")
+            except Exception as e:
+                print(f"[rebid] Slack投稿に失敗しました: {e}", file=sys.stderr)
+
+    try:
+        client.ensure_logged_in()
+        _clear_login_alert()
+        cancelled = []
+        for sbi_order_id in client.list_pending_order_ids():
+            client.cancel_order(sbi_order_id)
+            order_store.update_order_by_sbi_id(sbi_order_id, status="cancelled")
+            cancelled.append(sbi_order_id)
+        cancelled_note = f"注文{', '.join(cancelled)}を取消 → " if cancelled else ""
+
+        # 板は価格の降順なので、価格が数値で買数量がある最初の行が最良買気配。
+        # OVER/UNDER/成行の行は指値に使えないので飛ばす。
+        bid = None
+        for row in client.get_order_book(AUTO_REBID_TICKER)["rows"]:
+            if not row["bid_qty"]:
+                continue
+            try:
+                bid = float(row["price"])
+                break
+            except ValueError:
+                continue
+        if bid is None:
+            report(f"{cancelled_note}最良買気配が取れなかったため、今回の発注は見送りました")
+            return
+
+        qty = random.randrange(
+            AUTO_REBID_QTY_MIN, AUTO_REBID_QTY_MAX + 1, AUTO_REBID_QTY_STEP)
+        # 安全弁（SBI_MAX_ORDER_VALUE_YEN）は自動発注にも適用する。
+        # 上限内に収まるまで数量を下げるが、下限（QTY_MIN）を割ってまでは発注しない。
+        while qty > AUTO_REBID_QTY_MIN and qty * bid > MAX_ORDER_VALUE_YEN:
+            qty -= AUTO_REBID_QTY_STEP
+        if qty * bid > MAX_ORDER_VALUE_YEN:
+            report(
+                f"{cancelled_note}最小数量({AUTO_REBID_QTY_MIN}株)でも見積が"
+                f"上限({MAX_ORDER_VALUE_YEN:,.0f}円)を超えるため見送りました"
+                f"（最良買気配 {bid}円）")
+            return
+
+        order_id = order_store.create_order(AUTO_REBID_TICKER, "buy", qty, bid)
+        try:
+            sbi_order_id = client.place_order(AUTO_REBID_TICKER, "buy", qty, bid)
+        except Exception:
+            order_store.update_order(order_id, status="error")
+            raise
+        order_store.update_order(
+            order_id, status="submitted", sbi_order_id=sbi_order_id,
+            submitted_at=_now())
+        report(
+            f"{cancelled_note}{AUTO_REBID_TICKER} 買 {qty}株 @ {bid}円"
+            f" (注文番号{sbi_order_id})")
+    except HumanInterventionRequired as e:
+        _alert_login_needed(str(e))
+        report(f"実行できませんでした（要対応）: {e}")
+    except Exception as e:
+        report(f"実行に失敗しました: {e}")
+
+
 def _connect_with_retry():
     """ブラウザへの接続を失敗しても諦めずリトライする。
 
@@ -329,6 +414,8 @@ def _sbi_loop():
         time.monotonic() + random.uniform(PRICE_INTERVAL_MIN_SEC, PRICE_INTERVAL_MAX_SEC)
         if watch_price else None
     )
+    # 自動リビッドの初回は起動直後（15秒後）。以降はランダム間隔。
+    next_rebid = time.monotonic() + 15 if AUTO_REBID_TICKER else None
 
     while True:
         try:
@@ -354,6 +441,11 @@ def _sbi_loop():
                     _poll_price(client)
                 next_price_poll = now + random.uniform(
                     PRICE_INTERVAL_MIN_SEC, PRICE_INTERVAL_MAX_SEC)
+            if next_rebid is not None and now >= next_rebid:
+                if _is_market_hours():
+                    _auto_rebid(client)
+                next_rebid = now + random.uniform(
+                    AUTO_REBID_INTERVAL_MIN_SEC, AUTO_REBID_INTERVAL_MAX_SEC)
         except Exception as e:
             print(f"[sbi_loop] ポーリングで想定外のエラー: {e}", file=sys.stderr)
 
