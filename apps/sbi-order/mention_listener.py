@@ -23,6 +23,7 @@ import hmac
 import json
 import os
 import re
+import threading
 import time
 
 from config import CONF_DIR, ENV
@@ -114,6 +115,17 @@ def verify_signature(headers, raw_body):
     return hmac.compare_digest(computed, signature)
 
 
+def _react_async(channel, ts):
+    """メンションに👀リアクションを別スレッドで付ける（応答をブロックしない）。"""
+    def _run():
+        try:
+            import slack_client
+            slack_client.react(channel, ts, "eyes")
+        except Exception:
+            pass
+    threading.Thread(target=_run, daemon=True).start()
+
+
 def handle_event(headers, raw_body, bot_user_id, on_command, on_clear_all, on_book):
     """`/slack/events` へのPOSTを処理する。(status_code, response_body_bytes) を返す。
 
@@ -145,12 +157,9 @@ def handle_event(headers, raw_body, bot_user_id, on_command, on_clear_all, on_bo
         return 200, b"ok"
 
     # 受信の合図として、権限・書式チェックの前にまずメンションへ👀を付ける。
+    # Slackの3秒タイムアウト内に200を返せるよう、別スレッドで非同期に付ける。
     # リアクションは補助なので、失敗しても（reactions:write 未付与等）本処理は続ける。
-    try:
-        import slack_client
-        slack_client.react(event.get("channel"), event.get("ts"), "eyes")
-    except Exception:
-        pass
+    _react_async(event.get("channel"), event.get("ts"))
 
     user = event.get("user")
     channel = event.get("channel")
