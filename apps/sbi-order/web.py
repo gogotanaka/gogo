@@ -322,6 +322,7 @@ def _poll_price(client):
         for ticker in WATCH_TICKERS:
             book = client.get_order_book(ticker)
             slack_client.post(SLACK_CHANNEL, mention + format_order_book(ticker, book))
+            print(f"[price] {ticker} の板を投稿しました", file=sys.stderr)
     except HumanInterventionRequired as e:
         _alert_login_needed(str(e))
     except Exception as e:
@@ -330,6 +331,7 @@ def _poll_price(client):
 
 def _rebid_report(text):
     mention = f"<@{SLACK_MENTION_USER}> " if SLACK_MENTION_USER else ""
+    print(f"[rebid] {text}", file=sys.stderr)
     notify.notify("SBIリビッド", text)
     if SLACK_CHANNEL:
         try:
