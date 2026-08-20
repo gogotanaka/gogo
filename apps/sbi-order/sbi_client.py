@@ -365,9 +365,13 @@ class SBIClient:
         return orders
 
     def list_pending_order_ids(self):
-        """現在「注文中」（未約定・未取消）の全注文番号を返す。"""
+        """現在「注文中」（未約定・未取消）の全注文番号を返す。
+
+        部分約定中の行は「注文中(一部約定)」のような表記になりうるため、
+        完全一致ではなく部分一致で拾う（取り残すと二重発注になる）。
+        """
         return [o["order_id"] for o in self.read_order_table()
-                if o["status"] == "注文中"]
+                if "注文中" in o["status"]]
 
     def cancel_order(self, sbi_order_id):
         """指定注文番号を取消する。取消完了（受付済み）を確認できなければ
@@ -546,10 +550,15 @@ class SBIClient:
 def order_row_status(row):
     """read_order_table() の1行を 'submitted'|'filled'|'cancelled'|'expired' に写す。
 
-    「取消完了(一部約定)」のように取消と約定が併記されるため、取消・失効を
-    約定より先に判定する（実画面で確認済み、2026-08-20）。
+    判定順序が重要（実画面で確認済み、2026-08-20）:
+    - 「注文中(一部約定)」のような生きている部分約定行を約定済みと誤認しないよう、
+      まず「注文中」を submitted とする
+    - 「取消完了(一部約定)」のように取消と約定が併記されるため、取消・失効を
+      約定より先に判定する
     """
     status = row.get("status", "")
+    if "注文中" in status:
+        return "submitted"
     if "取消" in status:
         return "cancelled"
     if "失効" in status:

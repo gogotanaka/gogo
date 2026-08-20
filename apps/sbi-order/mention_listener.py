@@ -34,18 +34,25 @@ _SIDE_MAP = {
     "買い": "buy", "買": "buy", "buy": "buy",
     "売り": "sell", "売": "sell", "sell": "sell",
 }
+# \d はUnicodeの全角数字（３９３０等）も受理してしまい、後段の照会結果
+# （ASCII数字）と一致しない銘柄コードや int()/float() の想定外入力を生むため、
+# 数字は [0-9] に限定する。価格は「1.2.3」「.」を弾く形。
+_NUM = r"[0-9]+"
+_PRICE = r"[0-9]+(?:\.[0-9]+)?"
 _COMMAND_RE = re.compile(
-    r"^\s*(買い|買|buy|売り|売|sell)\s+(\d+)\s+(\d+)\s+([\d.]+)\s*$",
+    rf"^\s*(買い|買|buy|売り|売|sell)\s+({_NUM})\s+({_NUM})\s+({_PRICE})\s*$",
     re.IGNORECASE,
 )
 # `clear all` / `clear-all` の両方を受ける（言語仕様はハイフン、旧来の空白も互換）
 _CLEAR_ALL_RE = re.compile(r"^\s*clear[\s-]+all\s*$", re.IGNORECASE)
-_BOOK_RE = re.compile(r"^\s*book(?:\s+(\d+))?\s*$", re.IGNORECASE)
-_WATCH_RE = re.compile(r"^\s*watch\s+(\d+)\s+(\d+)\s+([\d.]+)\s+(\d+)\s*$", re.IGNORECASE)
+_BOOK_RE = re.compile(rf"^\s*book(?:\s+({_NUM}))?\s*$", re.IGNORECASE)
+_WATCH_RE = re.compile(
+    rf"^\s*watch\s+({_NUM})\s+({_NUM})\s+({_PRICE})\s+({_NUM})\s*$", re.IGNORECASE)
 _WATCH_OPEN_RE = re.compile(
-    r"^\s*watch-open\s+(買い|買|buy)\s+(\d+)\s+(\d+)\s+([\d.]+)\s*$", re.IGNORECASE)
-_UNWATCH_RE = re.compile(r"^\s*unwatch\s+(\d+)\s*$", re.IGNORECASE)
-_UNWATCH_OPEN_RE = re.compile(r"^\s*unwatch-open\s+(\d+)\s*$", re.IGNORECASE)
+    rf"^\s*watch-open\s+(買い|買|buy)\s+({_NUM})\s+({_NUM})\s+({_PRICE})\s*$",
+    re.IGNORECASE)
+_UNWATCH_RE = re.compile(rf"^\s*unwatch\s+({_NUM})\s*$", re.IGNORECASE)
+_UNWATCH_OPEN_RE = re.compile(rf"^\s*unwatch-open\s+({_NUM})\s*$", re.IGNORECASE)
 USAGE = (
     "書式が正しくありません。\n"
     "• `buy 3930 300 744` / `sell 3930 300 744` … 一回きりの指値注文（銘柄 株数 価格）\n"

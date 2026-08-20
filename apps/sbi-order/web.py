@@ -23,7 +23,8 @@ import order_store
 import watch_store
 import slack_client
 from config import ENV
-from sbi_client import HumanInterventionRequired, SBIClient, format_order_book
+from sbi_client import (
+    HumanInterventionRequired, SBIClient, format_order_book, order_row_status)
 
 PORT = 8381
 _BOT_USER_ID = None  # main()で解決。メンション本文から自分宛の<@ID>を取り除くのに使う。
@@ -71,6 +72,10 @@ def _now():
 # 他のスレッド（HTTPサーバ）は queue.Queue 経由でしか関与しない。
 _work_q = queue.Queue()
 _login_alert_sent = False
+# ログインが必要な状態が続く間、watch/watch-openのティックを一時的に控える
+# （自動再ログインの試行が共有タブを奪い続け、人間のOTP入力を妨害しないため）。
+# この時刻まではティックを見送り、期限が来たら1回だけ再試行する。
+_login_backoff_until = 0.0
 # 銘柄ごとの価格上限超え通知フラグ。超えている間の連投を防ぎ、上限以下に
 # 戻ったらリセットして次の超過時にまた1回だけ知らせる（_sbi_loopスレッドのみが書く）。
 _cap_alerted = {}
@@ -85,7 +90,8 @@ _mention_reply_targets = {}
 
 def _alert_login_needed(reason):
     """ログインが必要（想定外の画面）になったときに一度だけ知らせる。連投は避ける。"""
-    global _login_alert_sent
+    global _login_alert_sent, _login_backoff_until
+    _login_backoff_until = time.monotonic() + 300  # 5分はティックを控える
     notify.notify("SBI: ログインが必要です", reason)
     if _login_alert_sent:
         return
@@ -302,13 +308,18 @@ def _process_clear_all(client, channel, thread_ts):
         for sbi_order_id in order_ids:
             try:
                 client.cancel_order(sbi_order_id)
-                order_store.update_order_by_sbi_id(sbi_order_id, status="cancelled")
                 lines.append(f"注文{sbi_order_id}: 取消しました")
             except HumanInterventionRequired as e:
                 _alert_login_needed(str(e))
                 lines.append(f"注文{sbi_order_id}: 取消できませんでした（要対応）")
             except Exception as e:
                 lines.append(f"注文{sbi_order_id}: 取消に失敗しました ({e})")
+        # 取消状態・取消間際の約定株数は照会の再読みで確定させる
+        # （直接cancelledにすると部分約定分がfilled_qtyに残らない）
+        try:
+            _sync_orders_from_rows(client.read_order_table())
+        except Exception as e:
+            print(f"[clear-all] 取消後の照会再読みに失敗: {e}", file=sys.stderr)
         slack_client.post(channel, "全注文取消:\n" + "\n".join(lines), thread_ts=thread_ts)
     except HumanInterventionRequired as e:
         _alert_login_needed(str(e))
@@ -407,7 +418,8 @@ def _best_numeric_bid(client, ticker):
         if not row["bid_qty"]:
             continue
         try:
-            return float(row["price"])
+            # 1,000円以上の銘柄は価格セルがカンマ区切りになる
+            return float(row["price"].replace(",", ""))
         except ValueError:
             continue
     return None
@@ -440,6 +452,7 @@ def _rebid_tick(client, ticker, qty_target, price_cap, tag, still_valid,
     try:
         client.ensure_logged_in()
         _clear_login_alert()
+        state.pop("last_error", None)  # ログインが通ったら「要対応」連投抑止を解除
 
         bid = _best_numeric_bid(client, ticker)
         state["last_check"] = datetime.now(JST).strftime("%m/%d %H:%M:%S")
@@ -448,21 +461,31 @@ def _rebid_tick(client, ticker, qty_target, price_cap, tag, still_valid,
             _watch_report(f"{tag}: {ticker} の最良買気配が取れなかったため見送りました")
             state["last_action"] = "気配が読めず見送り"
             return
+        cap_key = f"{tag}:{ticker}"  # watchとwatch-openで上限が違いうるので別々に管理
         if bid > price_cap:
-            if not _cap_alerted.get(ticker):
-                _cap_alerted[ticker] = True
+            if not _cap_alerted.get(cap_key):
+                _cap_alerted[cap_key] = True
                 _watch_report(
                     f"{tag}: {ticker} の最良買気配が上限({price_cap:,.0f}円)を"
                     f"超えました（現在 {bid}円）。上限以下に戻るまで発注を見送ります"
                     f"（この通知は繰り返しません）")
             state["last_action"] = f"上限超え（気配 {bid}円 > {price_cap:,.0f}円）で見送り"
             return
-        _cap_alerted[ticker] = False
+        _cap_alerted[cap_key] = False
 
         rows = client.read_order_table()
         _sync_orders_from_rows(rows)
+        if not rows and order_store.pending_watch_orders():
+            # 追跡中の注文があるのに照会が空 = フィルタ切替失敗等の読み取り異常の
+            # 疑い。取消できていないまま発注すると注文が積み上がるので見送る。
+            _watch_report(
+                f"{tag}: {ticker} の注文照会が空でした（追跡中の注文があるため"
+                f"読み取り異常の疑い）。今回の発注は見送ります")
+            state["last_action"] = "照会が読めず見送り"
+            return
+        # 「注文中(一部約定)」も取り残すと二重発注になるため部分一致で拾う
         pending = [r for r in rows
-                   if r["status"] == "注文中" and r.get("ticker") == ticker]
+                   if "注文中" in r["status"] and r.get("ticker") == ticker]
 
         if skip_if_at_bid and pending:
             own = [order_store.get_order_by_sbi_id(r["order_id"]) for r in pending]
@@ -472,8 +495,21 @@ def _rebid_tick(client, ticker, qty_target, price_cap, tag, still_valid,
 
         cancelled = []
         for r in pending:
-            client.cancel_order(r["order_id"])
-            cancelled.append(r["order_id"])
+            try:
+                client.cancel_order(r["order_id"])
+                cancelled.append(r["order_id"])
+            except HumanInterventionRequired:
+                # 照会スナップショットと取消の間に約定/取消された可能性がある。
+                # 再読みして終端状態になっていれば正常系として続行、
+                # まだ注文中なら本当の異常なので投げ直す。
+                rows = client.read_order_table()
+                _sync_orders_from_rows(rows)
+                row_now = next(
+                    (x for x in rows if x["order_id"] == r["order_id"]), None)
+                if row_now is not None and order_row_status(row_now) == "submitted":
+                    raise
+                print(f"[watch] 注文{r['order_id']}は取消前に"
+                      f"約定/取消済みでした（正常続行）", file=sys.stderr)
         if cancelled:
             # 取消間際に入った約定を含む確定値を order_store に反映する
             rows = client.read_order_table()
@@ -545,8 +581,14 @@ def _rebid_tick(client, ticker, qty_target, price_cap, tag, still_valid,
         state["last_action"] = f"{cancelled_note}買 {qty}株 @ {bid}円 (注文番号{sbi_order_id})"
     except HumanInterventionRequired as e:
         _alert_login_needed(str(e))
-        _watch_report(f"{tag}: 実行できませんでした（要対応）: {e}")
+        # ログアウトが続く間、毎ティック同じ「要対応」をメンションで連投しない
+        if state.get("last_error") != str(e):
+            state["last_error"] = str(e)
+            _watch_report(f"{tag}: 実行できませんでした（要対応）: {e}")
+        else:
+            print(f"[watch] {tag}: 要対応が継続中: {e}", file=sys.stderr)
         state["last_action"] = f"要対応: {e}"
+        return
     except Exception as e:
         _watch_report(f"{tag}: 実行に失敗しました: {e}")
         state["last_action"] = f"失敗: {e}"
@@ -592,6 +634,11 @@ def _sbi_loop():
     if WATCH_TICKERS and not SLACK_CHANNEL:
         print("[price] SLACK_CHANNEL が未設定のため株価監視は行いません", file=sys.stderr)
 
+    abandoned = order_store.abandon_stale_pending()
+    if abandoned:
+        print(f"[startup] 前回のキューに残っていた注文 {abandoned}件を"
+              f"error（未発注）として打ち切りました", file=sys.stderr)
+
     client = _connect_with_retry()
     try:
         client.ensure_logged_in()
@@ -628,6 +675,20 @@ def _sbi_loop():
 
         try:
             now = time.monotonic()
+            # ブラウザごと再起動された場合はCDP接続が死ぬ。検知したら張り直す
+            # （タブ単位のクラッシュは ensure_logged_in 内の復旧が担当）。
+            try:
+                if client._browser and not client._browser.is_connected():
+                    print("[sbi_loop] ブラウザとのCDP接続が切れたため再接続します",
+                          file=sys.stderr)
+                    try:
+                        client.stop()
+                    except Exception:
+                        pass
+                    client = _connect_with_retry()
+            except Exception as e:
+                print(f"[sbi_loop] 接続状態の確認に失敗: {e}", file=sys.stderr)
+
             if now >= next_order_poll:
                 _poll_orders(client)
                 next_order_poll = now + POLL_INTERVAL_SEC
@@ -637,6 +698,11 @@ def _sbi_loop():
                     last_price_slot = slot
                     if _is_market_hours():
                         _poll_price(client)
+
+            if _login_alert_sent and now < _login_backoff_until:
+                # ログイン待ちの間はrebidを控える（人間のOTP入力の邪魔をしない）。
+                # 期限が来たら通常のティックが再試行し、成功すれば解除される。
+                continue
 
             data = watch_store.load()
             now_jst = datetime.now(JST)
@@ -766,8 +832,22 @@ h2{{margin:1.5rem 0 0}}
 
 
 class Handler(BaseHTTPRequestHandler):
+    def _is_local_request(self):
+        """web UI・手動発注をローカルからのアクセスに限定する。
+
+        サーバは127.0.0.1にバインドしているが、cloudflaredの公開トンネルが
+        /slack/events のためにこのポートへ向いているので、トンネル経由の
+        リクエストも127.0.0.1から来る。トンネル経由はCloudflareのヘッダ
+        （Cf-Ray等）が付き、Hostが公開ホスト名になるので、それで見分ける。
+        これが無いと第三者が公開URLから実発注できてしまう。
+        """
+        if self.headers.get("Cf-Ray") or self.headers.get("Cf-Connecting-Ip"):
+            return False
+        host = (self.headers.get("Host") or "").split(":")[0]
+        return host in ("localhost", "127.0.0.1")
+
     def do_GET(self):
-        if self.path != "/":
+        if self.path != "/" or not self._is_local_request():
             self.send_response(404)
             self.end_headers()
             return
@@ -777,9 +857,15 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == "/slack/events":
             self._handle_slack_event()
             return
-        if self.path != "/orders":
+        if self.path != "/orders" or not self._is_local_request():
             self.send_response(404)
             self.end_headers()
+            return
+        # ブラウザ発のクロスサイトPOST（CSRF）対策: Originが付いていて
+        # ローカル以外なら拒否する（curl等Origin無しのローカル操作は許可）。
+        origin = self.headers.get("Origin", "")
+        if origin and not origin.startswith(("http://localhost", "http://127.0.0.1")):
+            self._respond(403, _render(order_store.list_orders(), "拒否しました"))
             return
         length = int(self.headers.get("Content-Length", 0))
         body = self.rfile.read(length).decode("utf-8")
@@ -793,6 +879,11 @@ class Handler(BaseHTTPRequestHandler):
         except (KeyError, ValueError, AssertionError):
             self._respond(400, _render(order_store.list_orders(), "入力値が不正です"))
             return
+        if qty * price > MAX_ORDER_VALUE_YEN:
+            self._respond(400, _render(
+                order_store.list_orders(),
+                f"見積金額が上限（{MAX_ORDER_VALUE_YEN:,.0f}円）を超えるため発注しません"))
+            return
         order_id = order_store.create_order(ticker, side, qty, price)
         _work_q.put(("order", order_id))
         self._respond(200, _render(order_store.list_orders(), "発注をキューに入れました"))
@@ -800,6 +891,17 @@ class Handler(BaseHTTPRequestHandler):
     def _handle_slack_event(self):
         length = int(self.headers.get("Content-Length", 0))
         raw_body = self.rfile.read(length)
+        if _BOT_USER_ID is None:
+            # 起動時に auth.test が失敗したままイベントを処理すると
+            # re.escape(None) で落ちる。200で受けて処理はしない（Slackの再送
+            # ループを避ける）。復旧には web.py の再起動が必要。
+            print("[slack-event] _BOT_USER_ID 未解決のためイベントを無視しました"
+                  "（web.py を再起動してください）", file=sys.stderr)
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.end_headers()
+            self.wfile.write(b"ok (bot id unresolved)")
+            return
         print(f"[slack-event] received {length} bytes: {raw_body[:300]!r}", file=sys.stderr)
         status, body = mention_listener.handle_event(
             self.headers, raw_body, _BOT_USER_ID, {

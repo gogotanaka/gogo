@@ -20,6 +20,7 @@ updated_at は設定・置き換えのたびに更新され、_sbi_loop が「�
 """
 import json
 import os
+import sys
 import threading
 from datetime import datetime, timezone
 
@@ -37,7 +38,15 @@ def _load_nolock():
     try:
         with open(WATCHES_PATH) as f:
             data = json.load(f)
-    except (FileNotFoundError, ValueError):
+    except FileNotFoundError:
+        data = {}
+    except ValueError as e:
+        # 壊れたJSONを「全watch解除」と同一視しない: 空扱いにはするが（発注は
+        # 止まる=安全側）、大声で知らせる。次の設定コマンドで上書きされると
+        # 他の設定が失われるため、気づいたら手で直すこと。
+        print(f"[watch_store] {WATCHES_PATH} が壊れています（{e}）。"
+              f"全watchを無効扱いにしています。手動で修復してください。",
+              file=sys.stderr)
         data = {}
     data.setdefault("watches", {})
     data.setdefault("watch_opens", {})
