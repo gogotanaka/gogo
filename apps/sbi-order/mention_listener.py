@@ -231,8 +231,16 @@ def handle_event(headers, raw_body, bot_user_id, handlers):
     mention_user = ENV.get("SLACK_MENTION_USER", "")
 
     def reply(text):
+        # 返信は確認用のベストエフォート。投稿失敗でハンドラ本体（キュー投入・
+        # 設定変更）を巻き込まない。失敗時のHTTP無応答→Slack再送は
+        # X-Slack-Retry-Num で捨てられるため、ここで落ちるとコマンドが消える。
+        import sys
+
         import slack_client
-        slack_client.post(channel, text, thread_ts=thread_ts)
+        try:
+            slack_client.post(channel, text, thread_ts=thread_ts)
+        except Exception as e:
+            print(f"[mention] 返信に失敗しました: {e}", file=sys.stderr)
 
     if user != mention_user:
         reply("権限がありません（登録済みユーザーのみ発注できます）。")

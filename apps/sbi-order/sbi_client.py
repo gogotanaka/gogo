@@ -317,13 +317,24 @@ class SBIClient:
         rows = self.page.locator("table tr").all()
 
         def _cell_texts(tr, limit):
+            """セルのテキストを読む。読取り失敗は「空セル」ではなく例外にする。
+
+            握りつぶして '' を返すと、その論理行がスナップショットから黙って
+            消え、下流が「注文が存在しない」と同一視して二重発注・追跡打ち切りに
+            至る（レビューで確認）。1回だけリトライし、それでも駄目なら
+            スナップショット全体を失敗として扱う（呼び出し側はティック中断）。
+            """
             cells = tr.locator("td").all()[:limit]
             texts = []
             for c in cells:
-                try:
-                    texts.append(c.inner_text(timeout=300).strip())
-                except Exception:
-                    texts.append("")
+                for attempt in (1, 2):
+                    try:
+                        texts.append(c.inner_text(timeout=1000).strip())
+                        break
+                    except Exception as e:
+                        if attempt == 2:
+                            raise RuntimeError(
+                                f"注文照会のセル読取りに失敗しました: {e}")
             return texts
 
         orders = []

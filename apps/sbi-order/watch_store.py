@@ -38,14 +38,22 @@ def _load_nolock():
     try:
         with open(WATCHES_PATH) as f:
             data = json.load(f)
+        if not isinstance(data, dict):
+            raise ValueError(f"想定外の型: {type(data).__name__}")
     except FileNotFoundError:
         data = {}
     except ValueError as e:
         # 壊れたJSONを「全watch解除」と同一視しない: 空扱いにはするが（発注は
-        # 止まる=安全側）、大声で知らせる。次の設定コマンドで上書きされると
-        # 他の設定が失われるため、気づいたら手で直すこと。
+        # 止まる=安全側）、.corrupt へ退避して修復材料を保全する（退避しないと
+        # 次の設定コマンドが壊れた本体を上書きし、他の設定が失われる）。
+        corrupt = WATCHES_PATH + ".corrupt"
+        try:
+            os.replace(WATCHES_PATH, corrupt)
+        except OSError:
+            corrupt = "(退避失敗)"
         print(f"[watch_store] {WATCHES_PATH} が壊れています（{e}）。"
-              f"全watchを無効扱いにしています。手動で修復してください。",
+              f"{corrupt} へ退避し、全watchを無効扱いにしています。"
+              f"必要なら内容を確認して再設定してください。",
               file=sys.stderr)
         data = {}
     data.setdefault("watches", {})
@@ -57,6 +65,8 @@ def _save_nolock(data):
     tmp = WATCHES_PATH + ".tmp"
     with open(tmp, "w") as f:
         json.dump(data, f, ensure_ascii=False, indent=1)
+        f.flush()
+        os.fsync(f.fileno())  # 電源断での空ファイル化（=全watch消失）を防ぐ
     os.replace(tmp, WATCHES_PATH)
     try:
         os.chmod(WATCHES_PATH, 0o600)

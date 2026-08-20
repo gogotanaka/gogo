@@ -78,18 +78,30 @@ def pending_watch_orders():
         return [dict(r) for r in rows]
 
 
+def unnotified_fills():
+    """約定済みだが通知が未達（notified_at が空）の注文。再通知に使う。"""
+    with _conn() as conn:
+        rows = conn.execute(
+            "SELECT * FROM orders WHERE status = 'filled' AND notified_at IS NULL"
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
 def abandon_stale_pending():
     """再起動時、キュー（メモリ）ごと消えた 'pending' の注文を error で打ち切る。
 
-    「受け付けました」と返信済みなのに静かに消える事故を、少なくとも記録上
-    見えるようにする。戻り値は打ち切った件数。
+    「受け付けました」と返信済みなのに静かに消える事故を防ぐため、打ち切った
+    注文の一覧を返す（呼び出し側がSlack等で知らせる）。
     """
     with _conn() as conn:
-        cur = conn.execute(
-            "UPDATE orders SET status = 'error',"
-            " error_message = '再起動によりキューから失われたため発注されていません'"
-            " WHERE status = 'pending'")
-        return cur.rowcount
+        rows = [dict(r) for r in conn.execute(
+            "SELECT * FROM orders WHERE status = 'pending'").fetchall()]
+        if rows:
+            conn.execute(
+                "UPDATE orders SET status = 'error',"
+                " error_message = '再起動によりキューから失われたため発注されていません'"
+                " WHERE status = 'pending'")
+        return rows
 
 
 def filled_qty_since(ticker, side, since_iso):
