@@ -47,9 +47,6 @@ WATCH_MIN_INTERVAL_SEC = 60
 WATCH_OPEN_START = dt_time(8, 59)
 WATCH_OPEN_END = dt_time(9, 5, 59)
 WATCH_OPEN_INTERVAL_SEC = int(ENV.get("SBI_WATCH_OPEN_INTERVAL_SEC", "20"))
-# watchティックは数十秒かかるため、この時刻以降はwatch-open対象銘柄のwatchを
-# 止めて、8:59:00のwatch-open初回ティックが遅れないようにする
-WATCH_OPEN_GUARD_START = dt_time(8, 57)
 
 JST = timezone(timedelta(hours=9))
 
@@ -287,12 +284,17 @@ def _on_watch(parsed, channel, thread_ts, reply):
     prev = watch_store.set_watch(
         parsed["ticker"], parsed["avg_qty"], parsed["price_cap"],
         parsed["avg_interval_sec"])
+    suppressed_note = (
+        f"\n※この銘柄にはwatch-openが設定されています。watch-openがある間は"
+        f"watch-openだけが実行され、このwatchは休止します"
+        f"（`unwatch-open {parsed['ticker']}` で再開）。"
+        if watch_store.get_watch_open(parsed["ticker"]) else "")
     reply(
         f"watch設定{'（置き換え）' if prev else ''}: {parsed['ticker']} を"
         f"平均{parsed['avg_qty']}株(±30%)・上限{parsed['price_cap']:,.0f}円・"
         f"平均{parsed['avg_interval_sec']}秒(±30%)間隔でrebid"
         f"（その銘柄の未約定注文を取消して最良買気配に買い指値）し続けます。"
-        f"場中なら即時開始。解除は `unwatch {parsed['ticker']}`。"
+        f"場中なら即時開始。解除は `unwatch {parsed['ticker']}`。{suppressed_note}"
     )
 
 
@@ -313,11 +315,15 @@ def _on_watch_open(parsed, channel, thread_ts, reply):
         return
     prev = watch_store.set_watch_open(
         parsed["ticker"], parsed["side"], parsed["qty"], parsed["price_cap"])
+    suppressed_note = (
+        f"\n※この銘柄のwatchは、watch-openがある間は休止します"
+        f"（watch-openだけが実行されます）。"
+        if watch_store.get_watch(parsed["ticker"]) else "")
     reply(
         f"watch-open設定{'（置き換え）' if prev else ''}: {parsed['ticker']} を"
         f"{parsed['qty']}株・上限{parsed['price_cap']:,.0f}円で、毎営業日の"
         f"8:59〜9:05に{WATCH_OPEN_INTERVAL_SEC}秒毎のrebidを実行します。"
-        f"解除は `unwatch-open {parsed['ticker']}`。"
+        f"解除は `unwatch-open {parsed['ticker']}`。{suppressed_note}"
     )
 
 
@@ -338,7 +344,10 @@ def _on_unwatch_open(ticker, channel, thread_ts, reply):
     if prev is None:
         reply(f"{ticker} のwatch-openは設定されていません。")
         return
-    reply(f"{ticker} のwatch-openを解除しました。")
+    resume_note = (
+        f" この銘柄のwatchが再開します（場中なら即時）。"
+        if watch_store.get_watch(ticker) else "")
+    reply(f"{ticker} のwatch-openを解除しました。{resume_note}")
 
 
 def _on_book_request(ticker, channel, thread_ts, reply):
@@ -838,10 +847,6 @@ def _sbi_loop():
                 and WATCH_OPEN_START <= now_jst.time() <= WATCH_OPEN_END)
             open_tick_due = in_open_window and any(
                 now >= next_open_tick.get(t, 0) for t in data["watch_opens"])
-            # ティック1回は数十秒かかるため、窓の直前からwatchはwatch-openに譲る
-            near_open_window = (
-                now_jst.weekday() < 5
-                and WATCH_OPEN_GUARD_START <= now_jst.time() <= WATCH_OPEN_END)
 
             if now >= next_order_poll:
                 _poll_orders(client)
@@ -871,8 +876,10 @@ def _sbi_loop():
 
             if _is_market_hours(now_jst):
                 for ticker, w in data["watches"].items():
-                    if near_open_window and ticker in data["watch_opens"]:
-                        continue  # 寄り付きの窓（直前2分含む）は watch-open に譲る
+                    if ticker in data["watch_opens"]:
+                        # 同一銘柄に watch-open がある間は watch-open だけを実行する
+                        # （watch は設定を残したまま休止。unwatch-open で再開）
+                        continue
                     if seen_watch_updated.get(ticker) != w["updated_at"]:
                         # 新規設定・置き換えは即時に初回ティック。
                         # 上限超え通知の抑止も新設定でリセットする
@@ -903,6 +910,9 @@ def _render(orders, message=""):
         st = _loop_state.get(ticker, {})
         bought = order_store.filled_qty_since(ticker, "buy", today_start)
         last_bid = st.get("last_bid")
+        suppressed = ticker in data["watch_opens"]
+        action = ("watch-open優先のため休止中（unwatch-openで再開）"
+                  if suppressed else str(st.get("last_action") or "—"))
         watch_rows += (
             f"<tr><td>{html.escape(ticker)}</td>"
             f"<td>平均{w['avg_qty']}株 (±30%)</td>"
@@ -910,7 +920,7 @@ def _render(orders, message=""):
             f"<td>平均{w['avg_interval_sec']}秒 (±30%)</td>"
             f"<td>{html.escape(st.get('last_check') or '—')}</td>"
             f"<td>{html.escape(str(last_bid) + '円' if last_bid is not None else '—')}</td>"
-            f"<td>{html.escape(str(st.get('last_action') or '—'))}</td>"
+            f"<td>{html.escape(action)}</td>"
             f"<td>{bought}株</td></tr>"
         )
     if not watch_rows:
