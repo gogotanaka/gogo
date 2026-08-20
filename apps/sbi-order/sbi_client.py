@@ -22,6 +22,8 @@
 そのChromeでSBIに（パスキーで）ログインしておけば、このクライアントがそのタブに
 接続して以降の操作を行う。
 """
+import re
+
 from playwright.sync_api import sync_playwright
 
 from config import ENV
@@ -240,14 +242,20 @@ class SBIClient:
             self.page.locator("#pwd3").fill(self.env["SBI_TRADE_PASSWORD"])
             self.page.locator("#botton2").click(timeout=10000)
             self.page.wait_for_load_state("domcontentloaded")
-            self.page.wait_for_timeout(1500)
 
-            if not self.page.get_by_text("ご注文を受け付けました", exact=False).count():
+            # 受付文言は固定1.5秒待ち+一発判定だと描画遅延で「受注済みなのに
+            # エラー扱い」になりうる（→呼び出し側で孤児注文になる）ため、
+            # 最大15秒待つ。それでも出なければエラー本文を添えて失敗にする。
+            try:
+                self.page.get_by_text(
+                    "ご注文を受け付けました", exact=False).first.wait_for(timeout=15000)
+            except Exception:
                 # 発注入力画面に留まったままの場合、値幅制限超過等のエラーが
                 # 赤字で表示される（例:「注文価格が制限値幅を超えています」）。
                 # 正確な位置は不定なので、ページ本文の先頭付近をそのまま添える。
                 snippet = self.page.locator("body").inner_text(timeout=1000)[:300]
-                raise RuntimeError(f"発注が受け付けられませんでした: {snippet!r}")
+                raise RuntimeError(
+                    f"発注の受付確認が取れませんでした（受注済みの可能性あり）: {snippet!r}")
             order_no_row = self.page.locator("tr:has-text('注文番号')").last
             return order_no_row.locator("td").last.inner_text().strip()
         except HumanInterventionRequired:
@@ -259,64 +267,130 @@ class SBIClient:
             )
 
     def check_order_status(self, sbi_order_id):
-        """注文照会画面を開き、指定注文番号の状態を返す。
+        """注文照会を読み、指定注文番号の状態を返す。
 
-        戻り値は 'submitted' | 'filled' | 'cancelled' | 'unknown' のいずれか。
-        列: 注文番号 / 注文状況 / 注文種別 / 銘柄コード市場 / ... / 約定 / 約定日時 /
-        約定株数 / 約定単価（実画面で確認済み）。約定済みかどうかは「全部約定」等、
-        行のテキストに「約定」が含まれるかで判定している（未約定の行は「注文中」）。
+        戻り値は 'submitted' | 'filled' | 'cancelled' | 'expired' | 'unknown'。
+        read_order_table() の注文番号「完全一致」で行を特定する（以前の
+        tr:has-text() は部分文字列一致のため、注文番号が株数・価格・銘柄コード等の
+        数字と衝突すると誤った行を読む欠陥があった）。
         """
-        self._open_order_inquiry()
+        for o in self.read_order_table():
+            if o["order_id"] == str(sbi_order_id):
+                return order_row_status(o)
+        return "unknown"
 
-        # tr:has-text() は入れ子テーブルだと外側の大きな行にもマッチしてしまうため、
-        # 一番内側（＝実際のデータ行）である最後のマッチを使う。
-        row = self.page.locator(f"tr:has-text('{sbi_order_id}')")
-        if row.count() == 0:
-            return "unknown"
-        # 列構成（実画面で確認済み）: 0=注文番号 1=注文状況 2=注文種別 3=銘柄コード市場
-        # 4=利用ポイント 5=取消/訂正リンク 6=関連番号 ...
-        # 5列目に「取消」という文字列が常に出る（取消操作へのリンクのため）ので、
-        # そこを状態文字列と誤認しないよう、必ず1列目（注文状況）だけを見る。
-        status_text = row.last.locator("td").nth(1).inner_text().strip()
-        if "取消" in status_text:
-            return "cancelled"
-        if "約定" in status_text:
-            return "filled"
-        return "submitted"
+    def _open_order_inquiry(self, all_orders=True):
+        """「取引」→「注文照会」と辿り、注文一覧テーブルの画面を開く。
 
-    def _open_order_inquiry(self):
-        """「取引」→「注文照会」と辿り、注文一覧テーブルの画面を開く。"""
+        既定フィルタ「注文中・待機中」は約定済み・取消済み・失効の行を隠す
+        （2026-08-20 実画面で確認: 全部約定した注文が既定表示から消え、ポーラーが
+        unknown 扱いにしていた）。all_orders=True なら「全ての注文」リンクを
+        クリックして全行を表示させる。フィルタはページ遷移で既定に戻るので毎回行う。
+        """
         self.page.goto(HOME_URL, wait_until="domcontentloaded")
         self.page.wait_for_timeout(1000)
         self._click_visible_text("取引")
         self.page.wait_for_load_state("domcontentloaded")
         self._click_visible_text("注文照会")
         self.page.wait_for_load_state("domcontentloaded")
+        if all_orders:
+            self._click_visible_text("全ての注文")
+            self.page.wait_for_load_state("domcontentloaded")
+            self.page.wait_for_timeout(800)
+
+    def read_order_table(self):
+        """注文照会の全論理行（全ての注文フィルタ）を構造化して返す。
+
+        戻り値: [{'order_id': str, 'status': str, 'ticker': str|None,
+                  'qty': int|None, 'unfilled': int|None, 'filled_execs': int|None}]
+
+        1論理行は2つの<tr> + 約定が発生していれば約定明細の<tr>が続く
+        （実画面のダンプで確認済み、2026-08-20）:
+          1つ目: 注文番号(rowspan=2) / 注文状況 / 注文種別 / 銘柄（例 'はてな 3930 東証'）/ 利用ポイント / 取消訂正 / 関連番号
+          2つ目: 取引・預り / 注文日・期間 / 注文株数（未約定）例 '600 (600)' / 執行条件 / 注文単価
+          約定行: '約定' / 市場 / 約定日時 / 約定株数 / 約定単価（1約定につき1行）
+        filled_execs は約定明細行の約定株数の合計（明細行が無ければ None）。
+        部分約定を含む正確な約定株数はこの明細合計が正で、（未約定）セルは
+        「注文中」の行でのみ検証済み（取消完了・失効の行での表示仕様は未確証）。
+        """
+        self._open_order_inquiry(all_orders=True)
+        rows = self.page.locator("table tr").all()
+
+        def _cell_texts(tr, limit):
+            """セルのテキストを読む。読取り失敗は「空セル」ではなく例外にする。
+
+            握りつぶして '' を返すと、その論理行がスナップショットから黙って
+            消え、下流が「注文が存在しない」と同一視して二重発注・追跡打ち切りに
+            至る（レビューで確認）。1回だけリトライし、それでも駄目なら
+            スナップショット全体を失敗として扱う（呼び出し側はティック中断）。
+            """
+            cells = tr.locator("td").all()[:limit]
+            texts = []
+            for c in cells:
+                for attempt in (1, 2):
+                    try:
+                        texts.append(c.inner_text(timeout=1000).strip())
+                        break
+                    except Exception as e:
+                        if attempt == 2:
+                            raise RuntimeError(
+                                f"注文照会のセル読取りに失敗しました: {e}")
+            return texts
+
+        orders = []
+        i = 0
+        while i < len(rows):
+            head = _cell_texts(rows[i], 4)
+            if len(head) >= 2 and head[0].isdigit() and any(
+                    k in head[1] for k in ("注文", "約定", "取消", "失効", "待機")):
+                ticker = None
+                if len(head) >= 4:
+                    m = re.search(r"\b(\d{4})\b", head[3])
+                    if m:
+                        ticker = m.group(1)
+                entry = {"order_id": head[0], "status": head[1], "ticker": ticker,
+                         "qty": None, "unfilled": None, "filled_execs": None}
+                if i + 1 < len(rows):
+                    detail = _cell_texts(rows[i + 1], 3)
+                    if len(detail) >= 3:
+                        m = re.match(r"([\d,]+)\s*[（(]([\d,]+)[)）]", detail[2])
+                        if m:
+                            entry["qty"] = int(m.group(1).replace(",", ""))
+                            entry["unfilled"] = int(m.group(2).replace(",", ""))
+                # 約定明細行（td[0]が「約定」）を読めるだけ読む
+                j = i + 2
+                while j < len(rows):
+                    exec_cells = _cell_texts(rows[j], 4)
+                    if len(exec_cells) >= 4 and exec_cells[0] == "約定":
+                        qty_text = exec_cells[3].replace(",", "")
+                        if qty_text.isdigit():
+                            entry["filled_execs"] = (
+                                (entry["filled_execs"] or 0) + int(qty_text))
+                        j += 1
+                        continue
+                    break
+                orders.append(entry)
+                i = j
+                continue
+            i += 1
+        return orders
 
     def list_pending_order_ids(self):
         """現在「注文中」（未約定・未取消）の全注文番号を返す。
 
-        rowspanで1論理行が複数<tr>にまたがる構造のため、tr単位でtd[0]が数字
-        （注文番号）かつtd[1]が「注文中」の行だけを拾う（実画面で確認済み）。
+        部分約定中の行は「注文中(一部約定)」のような表記になりうるため、
+        完全一致ではなく部分一致で拾う（取り残すと二重発注になる）。
         """
-        self._open_order_inquiry()
-        order_ids = []
-        for row in self.page.locator("table tr").all():
-            cells = row.locator("td").all()
-            if len(cells) < 2:
-                continue
-            try:
-                order_id = cells[0].inner_text(timeout=300).strip()
-                status = cells[1].inner_text(timeout=300).strip()
-            except Exception:
-                continue
-            if order_id.isdigit() and status == "注文中":
-                order_ids.append(order_id)
-        return order_ids
+        return [o["order_id"] for o in self.read_order_table()
+                if "注文中" in o["status"]]
 
     def cancel_order(self, sbi_order_id):
         """指定注文番号を取消する。取消完了（受付済み）を確認できなければ
         HumanInterventionRequired を投げる。
+
+        対象行は注文番号セル（td[0]）の「完全一致」で特定する（以前の
+        tr:has-text() は部分文字列一致のため、注文番号が他行の株数・価格等と
+        衝突すると別の注文を誤取消しうる欠陥があった）。
 
         画面は発注の確認画面と違って1段階（内容確認＋取引パスワード入力＋
         「注文取消」ボタンのみ）。取引パスワード欄は #pwd3（発注時と同じ、
@@ -324,8 +398,22 @@ class SBIClient:
         input[name='ACT_place'][value='注文取消']。実画面で確認済み。
         """
         try:
-            self._open_order_inquiry()
-            row = self.page.locator(f"tr:has-text('{sbi_order_id}')").last
+            # 取消リンクは既定フィルタ（注文中・待機中）の行にもあるのでそれを使う
+            self._open_order_inquiry(all_orders=False)
+            row = None
+            for tr in self.page.locator("table tr").all():
+                cells = tr.locator("td").all()
+                if len(cells) < 2:
+                    continue
+                try:
+                    if cells[0].inner_text(timeout=300).strip() == str(sbi_order_id):
+                        row = tr
+                        break
+                except Exception:
+                    continue
+            if row is None:
+                raise RuntimeError(
+                    f"注文照会（注文中・待機中）に注文{sbi_order_id}の行がありません")
             row.get_by_text("取消", exact=True).click(timeout=10000)
             self.page.wait_for_load_state("domcontentloaded")
             self.page.wait_for_timeout(1000)
@@ -468,6 +556,27 @@ class SBIClient:
             if row["bid_qty"]:
                 return row["price"], row["bid_qty"]
         return None
+
+
+def order_row_status(row):
+    """read_order_table() の1行を 'submitted'|'filled'|'cancelled'|'expired' に写す。
+
+    判定順序が重要（実画面で確認済み、2026-08-20）:
+    - 「注文中(一部約定)」のような生きている部分約定行を約定済みと誤認しないよう、
+      まず「注文中」を submitted とする
+    - 「取消完了(一部約定)」のように取消と約定が併記されるため、取消・失効を
+      約定より先に判定する
+    """
+    status = row.get("status", "")
+    if "注文中" in status:
+        return "submitted"
+    if "取消" in status:
+        return "cancelled"
+    if "失効" in status:
+        return "expired"
+    if "約定" in status:
+        return "filled"
+    return "submitted"
 
 
 def _to_int(text):

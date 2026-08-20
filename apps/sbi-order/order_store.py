@@ -28,6 +28,12 @@ def _conn():
         " filled_at TEXT,"
         " notified_at TEXT"
         ")")
+    # 部分約定した株数（注文照会の約定明細から反映）。旧DBには無いので後付けする。
+    try:
+        conn.execute("ALTER TABLE orders ADD COLUMN filled_qty INTEGER")
+    except sqlite3.OperationalError as e:
+        if "duplicate column" not in str(e):
+            raise  # ロック等、列重複以外のエラーまで握りつぶさない
     if not existed:
         os.chmod(DB_PATH, 0o600)
     return conn
@@ -70,6 +76,55 @@ def pending_watch_orders():
         rows = conn.execute(
             "SELECT * FROM orders WHERE status = 'submitted'").fetchall()
         return [dict(r) for r in rows]
+
+
+def unnotified_fills():
+    """約定済みだが通知が未達（notified_at が空）の注文。再通知に使う。"""
+    with _conn() as conn:
+        rows = conn.execute(
+            "SELECT * FROM orders WHERE status = 'filled' AND notified_at IS NULL"
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def abandon_stale_pending():
+    """再起動時、キュー（メモリ）ごと消えた 'pending' の注文を error で打ち切る。
+
+    「受け付けました」と返信済みなのに静かに消える事故を防ぐため、打ち切った
+    注文の一覧を返す（呼び出し側がSlack等で知らせる）。
+    """
+    with _conn() as conn:
+        rows = [dict(r) for r in conn.execute(
+            "SELECT * FROM orders WHERE status = 'pending'").fetchall()]
+        if rows:
+            conn.execute(
+                "UPDATE orders SET status = 'error',"
+                " error_message = '再起動によりキューから失われたため発注されていません'"
+                " WHERE status = 'pending'")
+        return rows
+
+
+def filled_qty_since(ticker, side, since_iso):
+    """since_iso（UTC ISO）以降に発注した注文の約定株数合計。
+
+    filled_qty（部分約定含む実測）があればそれを、無ければ全部約定した注文の
+    qty を数える。買付サマリ表示用で、発注判断には使わない。
+    """
+    with _conn() as conn:
+        row = conn.execute(
+            "SELECT SUM(COALESCE(filled_qty,"
+            "  CASE WHEN status = 'filled' THEN qty ELSE 0 END)) AS total"
+            " FROM orders WHERE ticker = ? AND side = ? AND created_at >= ?",
+            (str(ticker), side, since_iso)).fetchone()
+        return row["total"] or 0
+
+
+def get_order_by_sbi_id(sbi_order_id):
+    with _conn() as conn:
+        row = conn.execute(
+            "SELECT * FROM orders WHERE sbi_order_id = ? ORDER BY id DESC LIMIT 1",
+            (str(sbi_order_id),)).fetchone()
+        return dict(row) if row else None
 
 
 def update_order_by_sbi_id(sbi_order_id, **fields):
