@@ -20,7 +20,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import mention_listener
 import notify
 import order_store
-import rebid_session
+import watch_store
 import slack_client
 from config import ENV
 from sbi_client import HumanInterventionRequired, SBIClient, format_order_book
@@ -37,14 +37,14 @@ SLACK_MENTION_USER = ENV.get("SLACK_MENTION_USER", "")
 # メンション経由の注文への安全弁: 見積金額がこれを超えたら発注せず拒否する。
 MAX_ORDER_VALUE_YEN = float(ENV.get("SBI_MAX_ORDER_VALUE_YEN", "500000"))
 
-# リビッドセッション（`start 銘柄 合計株数 上限価格` メンションで開始、`stop` で停止）:
-# 営業日の8:59（寄り付き直前）に初回、以降は場中この間隔（ランダム）で
-# 「未約定注文を全取消→最良買気配と同値で残量の買い指値」を繰り返す。
-# 間隔を固定にしないのは機械的なアクセスパターンを避けるため。
-REBID_START_TIME = dt_time(8, 59)
-REBID_INTERVAL_MIN_SEC = int(ENV.get("SBI_REBID_INTERVAL_MIN_SEC", "1200"))  # 20分
-REBID_INTERVAL_MAX_SEC = int(ENV.get("SBI_REBID_INTERVAL_MAX_SEC", "1800"))  # 30分
+# watch（常設rebid）/ watch-open（寄り付きrebid）の設定。
+# 間隔・株数を±30%でランダムにするのは機械的なアクセスパターンを避けるため。
 REBID_LOT_SIZE = int(ENV.get("SBI_REBID_LOT_SIZE", "100"))  # 売買単位
+WATCH_JITTER = 0.3  # 平均株数・平均間隔の±30%
+WATCH_MIN_INTERVAL_SEC = 60
+WATCH_OPEN_START = dt_time(8, 59)
+WATCH_OPEN_END = dt_time(9, 5, 59)
+WATCH_OPEN_INTERVAL_SEC = int(ENV.get("SBI_WATCH_OPEN_INTERVAL_SEC", "20"))
 
 JST = timezone(timedelta(hours=9))
 
@@ -71,9 +71,12 @@ def _now():
 # 他のスレッド（HTTPサーバ）は queue.Queue 経由でしか関与しない。
 _work_q = queue.Queue()
 _login_alert_sent = False
-# 自動リビッドの価格上限超え通知を出したか。超えている間の連投を防ぎ、
-# 上限以下に戻ったらリセットして次の超過時にまた1回だけ知らせる。
-_rebid_price_alerted = False
+# 銘柄ごとの価格上限超え通知フラグ。超えている間の連投を防ぎ、上限以下に
+# 戻ったらリセットして次の超過時にまた1回だけ知らせる（_sbi_loopスレッドのみが書く）。
+_cap_alerted = {}
+# web UI 表示用のスナップショット（ticker -> 直近の気配・アクション等）。
+# _sbi_loop が書き、HTTPスレッドは読むだけ。
+_loop_state = {}
 # Slackメンションから来た注文は、結果をそのスレッドにも返信する。
 # order_id -> (channel, thread_ts)。web UI経由の注文はここに登録されないので、
 # _reply_mention_result は何もせず無視するだけになる。
@@ -182,63 +185,71 @@ def _on_clear_all(channel, thread_ts, reply):
     _work_q.put(("clear_all", channel, thread_ts))
 
 
-_WEEKDAY_JA = "月火水木金土日"
+def _max_watch_estimate(qty, price_cap):
+    """watch のジッタ上振れ（+30%を売買単位に丸めた株数）での見積金額。"""
+    max_qty = int(qty * (1 + WATCH_JITTER))
+    max_qty -= max_qty % REBID_LOT_SIZE
+    return max(max_qty, REBID_LOT_SIZE) * price_cap
 
 
-def _next_rebid_start_date(now_jst):
-    """次の「8:59開始」の日付（JST）。8:59より前なら今日、以降なら翌日。
-    土日はティック側の営業日判定でスキップされるので、ここでは日付だけ進める。"""
-    if now_jst.time() < REBID_START_TIME:
-        return now_jst.date()
-    return (now_jst + timedelta(days=1)).date()
-
-
-def _on_start(parsed, channel, thread_ts, reply):
-    """`start 銘柄 合計株数 上限価格` メンションの入口（HTTPリクエストのスレッド）。
-    いつでも受け付け、次の営業日8:59開始の予約としてセッションファイルに置く。
-    セッションファイルだけを操作し、Playwrightには触らない。
+def _on_watch(parsed, channel, thread_ts, reply):
+    """`watch 銘柄 平均株数 上限価格 平均間隔秒` の入口（HTTPリクエストのスレッド）。
+    設定ファイルだけを操作し、Playwrightには触らない。_sbi_loop が updated_at の
+    変化を検知して場中なら即時に初回rebidを実行する。
     """
-    global _rebid_price_alerted
-    now_jst = datetime.now(JST)
-    begins_on = _next_rebid_start_date(now_jst)
-    prev = rebid_session.load()
-    rebid_session.start(
-        parsed["ticker"], parsed["target_qty"], parsed["price_cap"],
-        begins_on.isoformat())
-    _rebid_price_alerted = False
-    replaced = (
-        f"（既存セッション {prev['ticker']} {prev['target_qty']}株を置き換え）"
-        if prev else ""
-    )
-    reply(
-        f"リビッドセッションを予約しました{replaced}: {parsed['ticker']} を"
-        f"上限{parsed['price_cap']:,.0f}円で合計{parsed['target_qty']}株。"
-        f"{begins_on.strftime('%m/%d')}"
-        f"({_WEEKDAY_JA[begins_on.weekday()]})の8:59から（土日祝なら翌営業日）、"
-        f"場中に約{REBID_INTERVAL_MIN_SEC // 60}〜{REBID_INTERVAL_MAX_SEC // 60}分"
-        f"おきに未約定注文を全取消→最良買気配へ残量の買い指値を出します。`stop` で停止。"
-    )
-
-
-def _on_stop(channel, thread_ts, reply):
-    """`stop` メンションの入口（HTTPリクエストのスレッド）。"""
-    sess = rebid_session.load()
-    if not sess:
-        reply("実行中・予約中のリビッドセッションはありません。")
-        return
-    rebid_session.clear()
-    if sess.get("begins_on", "") > datetime.now(JST).date().isoformat():
+    if _max_watch_estimate(parsed["avg_qty"], parsed["price_cap"]) > MAX_ORDER_VALUE_YEN:
         reply(
-            f"開始前の予約（{sess['ticker']} 合計{sess['target_qty']}株・"
-            f"{sess['begins_on']} 8:59開始）を取り消しました。"
+            f"1回の見積金額（+30%上振れ時）が上限（{MAX_ORDER_VALUE_YEN:,.0f}円）を"
+            f"超えるため設定しません。上限は SBI_MAX_ORDER_VALUE_YEN で変更できます。"
         )
         return
-    bought = rebid_session.total_filled(sess)
+    prev = watch_store.set_watch(
+        parsed["ticker"], parsed["avg_qty"], parsed["price_cap"],
+        parsed["avg_interval_sec"])
     reply(
-        f"リビッドセッションを停止しました"
-        f"（{sess['ticker']} 買付済み {bought}/{sess['target_qty']}株）。"
-        f"未約定の注文はそのまま残ります（消すには `clear all`）。"
+        f"watch設定{'（置き換え）' if prev else ''}: {parsed['ticker']} を"
+        f"平均{parsed['avg_qty']}株(±30%)・上限{parsed['price_cap']:,.0f}円・"
+        f"平均{parsed['avg_interval_sec']}秒(±30%)間隔でrebid"
+        f"（その銘柄の未約定注文を取消して最良買気配に買い指値）し続けます。"
+        f"場中なら即時開始。解除は `unwatch {parsed['ticker']}`。"
     )
+
+
+def _on_watch_open(parsed, channel, thread_ts, reply):
+    """`watch-open buy 銘柄 株数 上限価格` の入口（HTTPリクエストのスレッド）。"""
+    if parsed["qty"] * parsed["price_cap"] > MAX_ORDER_VALUE_YEN:
+        reply(
+            f"見積金額が上限（{MAX_ORDER_VALUE_YEN:,.0f}円）を超えるため設定しません。"
+            f"上限は SBI_MAX_ORDER_VALUE_YEN で変更できます。"
+        )
+        return
+    prev = watch_store.set_watch_open(
+        parsed["ticker"], parsed["side"], parsed["qty"], parsed["price_cap"])
+    reply(
+        f"watch-open設定{'（置き換え）' if prev else ''}: {parsed['ticker']} を"
+        f"{parsed['qty']}株・上限{parsed['price_cap']:,.0f}円で、毎営業日の"
+        f"8:59〜9:05に{WATCH_OPEN_INTERVAL_SEC}秒毎のrebidを実行します。"
+        f"解除は `unwatch-open {parsed['ticker']}`。"
+    )
+
+
+def _on_unwatch(ticker, channel, thread_ts, reply):
+    prev = watch_store.remove_watch(ticker)
+    if prev is None:
+        reply(f"{ticker} のwatchは設定されていません。")
+        return
+    reply(
+        f"{ticker} のwatchを解除しました。未約定の注文はそのまま残ります"
+        f"（消すには `clear-all`）。"
+    )
+
+
+def _on_unwatch_open(ticker, channel, thread_ts, reply):
+    prev = watch_store.remove_watch_open(ticker)
+    if prev is None:
+        reply(f"{ticker} のwatch-openは設定されていません。")
+        return
+    reply(f"{ticker} のwatch-openを解除しました。")
 
 
 def _on_book_request(ticker, channel, thread_ts, reply):
@@ -307,33 +318,59 @@ def _process_clear_all(client, channel, thread_ts):
         slack_client.post(channel, f"全注文取消でエラーが発生しました: {e}", thread_ts=thread_ts)
 
 
-def _poll_orders(client):
+def _sync_orders_from_rows(rows):
+    """注文照会のスナップショットを order_store に反映する。
+
+    約定株数（filled_qty、部分約定含む）を先に反映してから終了状態
+    （約定・取消・失効）を確定する。行が見つからない注文は日またぎ等で
+    追跡対象から外れているので unknown で追跡を打ち切る（docs/adr/0011）。
+    """
+    by_id = {r["order_id"]: r for r in rows}
     for order in order_store.pending_watch_orders():
         if not order.get("sbi_order_id"):
             continue
         try:
-            client.ensure_logged_in()
-            _clear_login_alert()
-            status = client.check_order_status(order["sbi_order_id"])
+            row = by_id.get(str(order["sbi_order_id"]))
+            if row is None:
+                order_store.update_order(order["id"], status="unknown")
+                continue
+            filled = row.get("filled_execs")
+            if (filled is None and row.get("qty") is not None
+                    and row.get("unfilled") is not None and "注文中" in row["status"]):
+                filled = row["qty"] - row["unfilled"]
+            if filled is not None and filled > (order.get("filled_qty") or 0):
+                order_store.update_order(
+                    order["id"], filled_qty=min(filled, order["qty"]))
+            status = order_row_status(row)
             if status == "filled":
                 order_store.update_order(
-                    order["id"], status="filled", filled_at=_now(), notified_at=_now())
-                # リビッドセッション中の注文なら、買付済み株数にも反映する
-                rebid_session.record_fill(order["sbi_order_id"], order["qty"])
+                    order["id"], status="filled", filled_qty=order["qty"],
+                    filled_at=_now(), notified_at=_now())
                 _announce_fill(order)
-            elif status == "cancelled":
-                order_store.update_order(order["id"], status="cancelled")
-            elif status == "unknown":
-                # 注文照会一覧に見つからない = 何らかの理由（このアプリの外で
-                # 手動取消した等）で追跡対象から外れている。「submitted」の
-                # まま残すと毎回チェックし続けてしまう（過度な遷移の原因になった
-                # 実績あり、docs/adr/0011）ため、追跡を打ち切る。
-                order_store.update_order(order["id"], status="unknown")
-        except HumanInterventionRequired as e:
-            _alert_login_needed(str(e))
-            return  # ログインが必要なら残りの注文チェックも今回はスキップ
+            elif status in ("cancelled", "expired"):
+                order_store.update_order(order["id"], status=status)
         except Exception as e:
-            print(f"[poller] order {order['id']} の確認に失敗: {e}", file=sys.stderr)
+            print(f"[poller] order {order['id']} の反映に失敗: {e}", file=sys.stderr)
+
+
+def _poll_orders(client):
+    """未約定注文の状態確認。注文照会（全ての注文フィルタ）を1回だけ読み、
+    追跡中の全注文をそのスナップショットで判定する（以前は注文ごとに照会を
+    開いており、過度な遷移の原因かつ部分約定を拾えなかった）。
+    """
+    if not any(o.get("sbi_order_id") for o in order_store.pending_watch_orders()):
+        return
+    try:
+        client.ensure_logged_in()
+        _clear_login_alert()
+        rows = client.read_order_table()
+    except HumanInterventionRequired as e:
+        _alert_login_needed(str(e))
+        return
+    except Exception as e:
+        print(f"[poller] 注文照会の読み取りに失敗: {e}", file=sys.stderr)
+        return
+    _sync_orders_from_rows(rows)
 
 
 def _poll_price(client):
@@ -351,15 +388,15 @@ def _poll_price(client):
         print(f"[price] 板情報取得に失敗しました: {e}", file=sys.stderr)
 
 
-def _rebid_report(text):
+def _watch_report(text):
     mention = f"<@{SLACK_MENTION_USER}> " if SLACK_MENTION_USER else ""
-    print(f"[rebid] {text}", file=sys.stderr)
-    notify.notify("SBIリビッド", text)
+    print(f"[watch] {text}", file=sys.stderr)
+    notify.notify("SBI watch", text)
     if SLACK_CHANNEL:
         try:
-            slack_client.post(SLACK_CHANNEL, f"{mention}リビッド: {text}")
+            slack_client.post(SLACK_CHANNEL, f"{mention}{text}")
         except Exception as e:
-            print(f"[rebid] Slack投稿に失敗しました: {e}", file=sys.stderr)
+            print(f"[watch] Slack投稿に失敗しました: {e}", file=sys.stderr)
 
 
 def _best_numeric_bid(client, ticker):
@@ -376,101 +413,143 @@ def _best_numeric_bid(client, ticker):
     return None
 
 
-def _session_rebid(client):
-    """リビッドセッションの1ティック。
+def _jitter(avg):
+    """平均値の±30%（WATCH_JITTER）で毎回ランダムに揺らす。"""
+    return avg * random.uniform(1 - WATCH_JITTER, 1 + WATCH_JITTER)
 
-    1. 最良買気配を確認。セッションの上限価格を超えていれば、既存注文には
-       触らず見送る（通知は超えた最初の回だけ）
-    2. 注文照会を読み、セッション注文の約定株数（部分約定含む）を反映
-    3. 未約定の注文を全取消（セッション外の注文も含む）→ 取消後に再読みして
-       取消までに入った約定を確定
-    4. 残量（目標 − 買付済み）を売買単位に切り捨てて発注。目標到達なら
-       セッションを終了して報告
 
-    結果は毎回 SLACK_MENTION_USER 宛のメンションで報告する。発注は
-    order_store にも記録するので、全部約定は既存の60秒ポーラーも検知・通知する。
+def _today_jst_start_utc():
+    """JSTの今日0:00をUTCのISO文字列で返す（本日約定サマリの集計起点）。"""
+    now_jst = datetime.now(JST)
+    start = datetime(now_jst.year, now_jst.month, now_jst.day, tzinfo=JST)
+    return start.astimezone(timezone.utc).isoformat()
+
+
+def _rebid_tick(client, ticker, qty_target, price_cap, tag, still_valid,
+                skip_if_at_bid=False):
+    """1回の rebid: 最良買気配の確認 → 上限判定 → その銘柄の未約定注文を取消 →
+    株数を売買単位に丸めて買い指値。
+
+    still_valid() は発注直前に呼ばれ、False なら発注せず中断する（ティック中に
+    unwatch や設定の置き換えが入った場合の安全弁。板取得や取消は数十秒かかるため
+    HTTPスレッドの設定変更と重なりうる）。
+    skip_if_at_bid は watch-open（20秒毎）用: 自分の注文が既に最良買気配と同値で
+    並んでいるなら何もしない（取消→再発注は板の順番を失うだけ）。
     """
-    sess = rebid_session.load()
-    if not sess:
-        return
-    global _rebid_price_alerted
+    state = _loop_state.setdefault(ticker, {})
     try:
         client.ensure_logged_in()
         _clear_login_alert()
 
-        bid = _best_numeric_bid(client, sess["ticker"])
+        bid = _best_numeric_bid(client, ticker)
+        state["last_check"] = datetime.now(JST).strftime("%m/%d %H:%M:%S")
+        state["last_bid"] = bid
         if bid is None:
-            _rebid_report("最良買気配が取れなかったため、今回は何もしませんでした")
+            _watch_report(f"{tag}: {ticker} の最良買気配が取れなかったため見送りました")
+            state["last_action"] = "気配が読めず見送り"
             return
-
-        # 価格上限: 超えている間は既存注文に触らず見送る。通知は超えた最初の回だけ。
-        if bid > sess["price_cap"]:
-            if not _rebid_price_alerted:
-                _rebid_price_alerted = True
-                _rebid_report(
-                    f"最良買気配が上限({sess['price_cap']:,.0f}円)を超えました"
-                    f"（現在 {bid}円）。上限以下に戻るまで発注を見送ります"
+        if bid > price_cap:
+            if not _cap_alerted.get(ticker):
+                _cap_alerted[ticker] = True
+                _watch_report(
+                    f"{tag}: {ticker} の最良買気配が上限({price_cap:,.0f}円)を"
+                    f"超えました（現在 {bid}円）。上限以下に戻るまで発注を見送ります"
                     f"（この通知は繰り返しません）")
+            state["last_action"] = f"上限超え（気配 {bid}円 > {price_cap:,.0f}円）で見送り"
             return
-        _rebid_price_alerted = False
+        _cap_alerted[ticker] = False
 
         rows = client.read_order_table()
-        rebid_session.update_fills_from_rows(rows)
+        _sync_orders_from_rows(rows)
+        pending = [r for r in rows
+                   if r["status"] == "注文中" and r.get("ticker") == ticker]
+
+        if skip_if_at_bid and pending:
+            own = [order_store.get_order_by_sbi_id(r["order_id"]) for r in pending]
+            if all(o and o["side"] == "buy" and o["price"] == bid for o in own):
+                state["last_action"] = f"既に最良買気配({bid}円)に注文あり（{tag}）"
+                return  # 取消→再発注しても板の順番を失うだけなので何もしない
+
         cancelled = []
-        for row in rows:
-            if row["status"] != "注文中":
-                continue
-            client.cancel_order(row["order_id"])
-            order_store.update_order_by_sbi_id(row["order_id"], status="cancelled")
-            cancelled.append(row["order_id"])
+        for r in pending:
+            client.cancel_order(r["order_id"])
+            cancelled.append(r["order_id"])
         if cancelled:
-            # 取消の直前まで部分約定が入りうるので、取消後の確定値で数え直す
-            rebid_session.update_fills_from_rows(client.read_order_table())
+            # 取消間際に入った約定を含む確定値を order_store に反映する
+            rows = client.read_order_table()
+            _sync_orders_from_rows(rows)
         cancelled_note = f"注文{', '.join(cancelled)}を取消 → " if cancelled else ""
 
-        sess = rebid_session.load()
-        if not sess:
-            return
-        bought = rebid_session.total_filled(sess)
-        remaining = sess["target_qty"] - bought
-        remaining -= remaining % REBID_LOT_SIZE  # 売買単位に切り捨て
-        if remaining <= 0:
-            _rebid_report(
-                f"{cancelled_note}目標に到達しました"
-                f"（買付済み {bought}/{sess['target_qty']}株）。セッションを終了します")
-            rebid_session.clear()
+        if not still_valid():
+            _watch_report(
+                f"{tag}: {ticker} の設定がティック中に変更/解除されたため、"
+                f"今回の発注は見送りました")
+            state["last_action"] = "設定変更を検知し発注中断"
             return
 
-        # 安全弁（SBI_MAX_ORDER_VALUE_YEN）は自動発注にも適用する。
-        # 上限内に収まるまで数量を下げるが、売買単位を割ってまでは発注しない。
-        qty = remaining
+        qty = int(qty_target)
+        qty -= qty % REBID_LOT_SIZE
+        qty = max(qty, REBID_LOT_SIZE)
+        # 安全弁（SBI_MAX_ORDER_VALUE_YEN）。上限内に収まるまで数量を下げるが、
+        # 売買単位を割ってまでは発注しない。
         while qty > REBID_LOT_SIZE and qty * bid > MAX_ORDER_VALUE_YEN:
             qty -= REBID_LOT_SIZE
         if qty * bid > MAX_ORDER_VALUE_YEN:
-            _rebid_report(
-                f"{cancelled_note}最小数量({REBID_LOT_SIZE}株)でも見積が"
+            _watch_report(
+                f"{tag}: {cancelled_note}最小数量({REBID_LOT_SIZE}株)でも見積が"
                 f"上限({MAX_ORDER_VALUE_YEN:,.0f}円)を超えるため見送りました"
                 f"（最良買気配 {bid}円）")
+            state["last_action"] = "金額上限超えで見送り"
             return
 
-        order_id = order_store.create_order(sess["ticker"], "buy", qty, bid)
+        known_ids = {r["order_id"] for r in rows}
+        order_id = order_store.create_order(ticker, "buy", qty, bid)
         try:
-            sbi_order_id = client.place_order(sess["ticker"], "buy", qty, bid)
-        except Exception:
-            order_store.update_order(order_id, status="error")
-            raise
+            sbi_order_id = client.place_order(ticker, "buy", qty, bid)
+        except Exception as e:
+            order_store.update_order(order_id, status="error", error_message=str(e))
+            # 受付確認だけ失敗して実は受注済み、の可能性があるので照会と突合する
+            adopted = None
+            try:
+                rows2 = client.read_order_table()
+                cands = [r for r in rows2
+                         if r["order_id"] not in known_ids
+                         and r.get("ticker") == ticker and r.get("qty") == qty]
+                if len(cands) == 1:
+                    adopted = cands[0]["order_id"]
+            except Exception:
+                pass
+            if adopted:
+                order_store.update_order(
+                    order_id, status="submitted", sbi_order_id=adopted,
+                    submitted_at=_now(), error_message=None)
+                _watch_report(
+                    f"{tag}: {cancelled_note}発注の受付確認に失敗しましたが、"
+                    f"注文照会で確認できたため追跡します: {ticker} 買 {qty}株"
+                    f" @ {bid}円 (注文番号{adopted})")
+                state["last_action"] = f"買 {qty}株 @ {bid}円 (注文番号{adopted}, 突合で確認)"
+            else:
+                _watch_report(
+                    f"{tag}: {cancelled_note}発注に失敗しました（受注済みの可能性も"
+                    f"あるため注文照会を確認してください）: {e}")
+                state["last_action"] = f"発注失敗: {e}"
+            return
         order_store.update_order(
             order_id, status="submitted", sbi_order_id=sbi_order_id,
             submitted_at=_now())
-        rebid_session.add_order(sbi_order_id, qty)
-        _rebid_report(
-            f"{cancelled_note}{sess['ticker']} 買 {qty}株 @ {bid}円"
-            f" (注文番号{sbi_order_id}) — 買付済み {bought}/{sess['target_qty']}株")
+        bought_today = order_store.filled_qty_since(
+            ticker, "buy", _today_jst_start_utc())
+        _watch_report(
+            f"{tag}: {cancelled_note}{ticker} 買 {qty}株 @ {bid}円"
+            f" (注文番号{sbi_order_id}) — 本日約定 {bought_today}株")
+        state["last_action"] = f"{cancelled_note}買 {qty}株 @ {bid}円 (注文番号{sbi_order_id})"
     except HumanInterventionRequired as e:
         _alert_login_needed(str(e))
-        _rebid_report(f"実行できませんでした（要対応）: {e}")
+        _watch_report(f"{tag}: 実行できませんでした（要対応）: {e}")
+        state["last_action"] = f"要対応: {e}"
     except Exception as e:
-        _rebid_report(f"実行に失敗しました: {e}")
+        _watch_report(f"{tag}: 実行に失敗しました: {e}")
+        state["last_action"] = f"失敗: {e}"
 
 
 def _connect_with_retry():
@@ -524,22 +603,14 @@ def _sbi_loop():
 
     next_order_poll = time.monotonic() + POLL_INTERVAL_SEC
     # 板情報の定期投稿は時計に揃えたスロット（既定600秒 = 8:00, 8:10, ...）。
-    # 起動直後の場中は前のスロット扱いで1回すぐ投稿される。
+    # 起動直後の場中は前のスロット扱いで1回すぐ投稿される。スロットは場外でも
+    # 進める（進めないと昼休み明けにグリッド外の12:05投稿が入る）。
     last_price_slot = None
-    # リビッドセッション: begins_on（予約日）以降の各営業日、初回ティックは
-    # 8:59以降の最初のループで即実行。以降はランダム間隔。
-    next_rebid = 0.0
-    rebid_tick_date = None
-
-    def _run_rebid_tick():
-        nonlocal next_rebid, rebid_tick_date
-        rebid_tick_date = datetime.now(JST).date()
-        _session_rebid(client)
-        next_rebid = time.monotonic() + random.uniform(
-            REBID_INTERVAL_MIN_SEC, REBID_INTERVAL_MAX_SEC)
-
-    def _rebid_window_open(now_jst):
-        return _is_market_hours(now_jst) and now_jst.time() >= REBID_START_TIME
+    # watch のスケジュール（銘柄ごと）。seen_watch_updated は設定の新規・置き換えを
+    # 検知して即時ティックするための「最後に見た updated_at」。
+    next_watch_tick = {}
+    seen_watch_updated = {}
+    next_open_tick = {}
 
     while True:
         try:
@@ -562,17 +633,45 @@ def _sbi_loop():
                 next_order_poll = now + POLL_INTERVAL_SEC
             if watch_price:
                 slot = int(time.time() // PRICE_POST_INTERVAL_SEC)
-                if slot != last_price_slot and _is_market_hours():
+                if slot != last_price_slot:
                     last_price_slot = slot
-                    _poll_price(client)
-            if rebid_session.exists():
-                now_jst = datetime.now(JST)
-                if _rebid_window_open(now_jst):
-                    sess = rebid_session.load()
-                    # begins_on（予約日）前はまだ動かさない
-                    if sess and sess.get("begins_on", "") <= now_jst.date().isoformat():
-                        if rebid_tick_date != now_jst.date() or now >= next_rebid:
-                            _run_rebid_tick()
+                    if _is_market_hours():
+                        _poll_price(client)
+
+            data = watch_store.load()
+            now_jst = datetime.now(JST)
+            in_open_window = (
+                now_jst.weekday() < 5
+                and WATCH_OPEN_START <= now_jst.time() <= WATCH_OPEN_END)
+
+            if in_open_window:
+                for ticker, wo in data["watch_opens"].items():
+                    if now < next_open_tick.get(ticker, 0):
+                        continue
+                    _rebid_tick(
+                        client, ticker, wo["qty"], wo["price_cap"], "watch-open",
+                        still_valid=lambda t=ticker, w=wo:
+                            watch_store.get_watch_open(t) == w,
+                        skip_if_at_bid=True)
+                    next_open_tick[ticker] = time.monotonic() + WATCH_OPEN_INTERVAL_SEC
+
+            if _is_market_hours(now_jst):
+                for ticker, w in data["watches"].items():
+                    if in_open_window and ticker in data["watch_opens"]:
+                        continue  # 寄り付きの窓は watch-open に譲る
+                    if seen_watch_updated.get(ticker) != w["updated_at"]:
+                        # 新規設定・置き換えは即時に初回ティック
+                        seen_watch_updated[ticker] = w["updated_at"]
+                        next_watch_tick[ticker] = 0
+                    if now < next_watch_tick.get(ticker, 0):
+                        continue
+                    _rebid_tick(
+                        client, ticker, _jitter(w["avg_qty"]), w["price_cap"],
+                        "watch",
+                        still_valid=lambda t=ticker, w0=w:
+                            watch_store.get_watch(t) == w0)
+                    next_watch_tick[ticker] = time.monotonic() + max(
+                        WATCH_MIN_INTERVAL_SEC, _jitter(w["avg_interval_sec"]))
         except Exception as e:
             print(f"[sbi_loop] ポーリングで想定外のエラー: {e}", file=sys.stderr)
 
@@ -580,26 +679,77 @@ def _sbi_loop():
 # --- HTML ---
 
 def _render(orders, message=""):
+    data = watch_store.load()
+    today_start = _today_jst_start_utc()
+
+    watch_rows = ""
+    for ticker, w in sorted(data["watches"].items()):
+        st = _loop_state.get(ticker, {})
+        bought = order_store.filled_qty_since(ticker, "buy", today_start)
+        last_bid = st.get("last_bid")
+        watch_rows += (
+            f"<tr><td>{html.escape(ticker)}</td>"
+            f"<td>平均{w['avg_qty']}株 (±30%)</td>"
+            f"<td>{w['price_cap']:,.0f}円</td>"
+            f"<td>平均{w['avg_interval_sec']}秒 (±30%)</td>"
+            f"<td>{html.escape(st.get('last_check') or '—')}</td>"
+            f"<td>{html.escape(str(last_bid) + '円' if last_bid is not None else '—')}</td>"
+            f"<td>{html.escape(str(st.get('last_action') or '—'))}</td>"
+            f"<td>{bought}株</td></tr>"
+        )
+    if not watch_rows:
+        watch_rows = '<tr><td colspan="8" class="empty">（watchなし）</td></tr>'
+
+    open_rows = ""
+    for ticker, wo in sorted(data["watch_opens"].items()):
+        st = _loop_state.get(ticker, {})
+        open_rows += (
+            f"<tr><td>{html.escape(ticker)}</td>"
+            f"<td>{wo['qty']}株</td>"
+            f"<td>{wo['price_cap']:,.0f}円</td>"
+            f"<td>毎営業日 8:59〜9:05 / {WATCH_OPEN_INTERVAL_SEC}秒毎</td>"
+            f"<td>{html.escape(str(st.get('last_action') or '—'))}</td></tr>"
+        )
+    if not open_rows:
+        open_rows = '<tr><td colspan="5" class="empty">（watch-openなし）</td></tr>'
+
     rows = "".join(
         f"<tr><td>{o['id']}</td><td>{html.escape(o['ticker'])}</td>"
         f"<td>{html.escape(o['side'])}</td><td>{o['qty']}</td><td>{o['price']}</td>"
         f"<td>{html.escape(o['status'])}</td>"
+        f"<td>{o.get('filled_qty') if o.get('filled_qty') is not None else ''}</td>"
         f"<td>{html.escape(o.get('error_message') or '')}</td></tr>"
         for o in orders
     )
     msg_html = f'<p class="msg">{html.escape(message)}</p>' if message else ""
     return f"""<!doctype html><html lang="ja"><head><meta charset="utf-8">
-<title>SBI 発注</title>
+<meta http-equiv="refresh" content="30">
+<title>SBI 発注 / watch状況</title>
 <style>
-body{{font-family:-apple-system,sans-serif;max-width:760px;margin:2rem auto;padding:0 1rem}}
-table{{border-collapse:collapse;width:100%;margin-top:1rem}}
+body{{font-family:-apple-system,sans-serif;max-width:900px;margin:2rem auto;padding:0 1rem}}
+table{{border-collapse:collapse;width:100%;margin:.5rem 0 1.5rem}}
 td,th{{border:1px solid #ddd;padding:.4rem .6rem;text-align:left;font-size:.9rem}}
 form{{display:flex;gap:.5rem;flex-wrap:wrap;align-items:center}}
 input,select{{padding:.4rem}}
 .msg{{color:#c00}}
+.empty{{color:#999}}
+h2{{margin:1.5rem 0 0}}
+.note{{color:#666;font-size:.85rem}}
 </style></head><body>
-<h1>SBI 発注</h1>
+<h1>SBI 発注 / watch状況</h1>
 {msg_html}
+<h2>watch（常設rebid）</h2>
+<p class="note">場中、平均間隔(±30%)ごとに「その銘柄の未約定注文を取消 → 最良買気配に平均株数(±30%)の買い指値」。設定・解除はSlackメンション（<code>watch 3930 400 760 900</code> / <code>unwatch 3930</code>）。</p>
+<table>
+<tr><th>銘柄</th><th>株数</th><th>上限価格</th><th>間隔</th><th>最終チェック</th><th>最良買気配</th><th>直近アクション</th><th>本日約定</th></tr>
+{watch_rows}
+</table>
+<h2>watch-open（寄り付きrebid）</h2>
+<table>
+<tr><th>銘柄</th><th>株数</th><th>上限価格</th><th>実行タイミング</th><th>直近アクション</th></tr>
+{open_rows}
+</table>
+<h2>手動発注</h2>
 <form method="post" action="/orders">
   <input name="ticker" placeholder="銘柄コード" required>
   <select name="side"><option value="buy">買</option><option value="sell">売</option></select>
@@ -607,8 +757,9 @@ input,select{{padding:.4rem}}
   <input name="price" type="number" step="0.1" placeholder="指値価格" required>
   <button type="submit">発注</button>
 </form>
+<h2>注文履歴</h2>
 <table>
-<tr><th>ID</th><th>銘柄</th><th>売買</th><th>株数</th><th>価格</th><th>状態</th><th>エラー</th></tr>
+<tr><th>ID</th><th>銘柄</th><th>売買</th><th>株数</th><th>価格</th><th>状態</th><th>約定株数</th><th>エラー</th></tr>
 {rows}
 </table>
 </body></html>"""
@@ -651,8 +802,15 @@ class Handler(BaseHTTPRequestHandler):
         raw_body = self.rfile.read(length)
         print(f"[slack-event] received {length} bytes: {raw_body[:300]!r}", file=sys.stderr)
         status, body = mention_listener.handle_event(
-            self.headers, raw_body, _BOT_USER_ID, _on_mention_command, _on_clear_all,
-            _on_book_request, _on_start, _on_stop)
+            self.headers, raw_body, _BOT_USER_ID, {
+                "order": _on_mention_command,
+                "clear_all": _on_clear_all,
+                "book": _on_book_request,
+                "watch": _on_watch,
+                "watch_open": _on_watch_open,
+                "unwatch": _on_unwatch,
+                "unwatch_open": _on_unwatch_open,
+            })
         print(f"[slack-event] handled -> status={status} body={body[:200]!r}", file=sys.stderr)
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")

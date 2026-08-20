@@ -38,15 +38,23 @@ _COMMAND_RE = re.compile(
     r"^\s*(買い|買|buy|売り|売|sell)\s+(\d+)\s+(\d+)\s+([\d.]+)\s*$",
     re.IGNORECASE,
 )
-_CLEAR_ALL_RE = re.compile(r"^\s*clear\s+all\s*$", re.IGNORECASE)
+# `clear all` / `clear-all` の両方を受ける（言語仕様はハイフン、旧来の空白も互換）
+_CLEAR_ALL_RE = re.compile(r"^\s*clear[\s-]+all\s*$", re.IGNORECASE)
 _BOOK_RE = re.compile(r"^\s*book(?:\s+(\d+))?\s*$", re.IGNORECASE)
-_START_RE = re.compile(r"^\s*start\s+(\d+)\s+(\d+)\s+([\d.]+)\s*$", re.IGNORECASE)
-_STOP_RE = re.compile(r"^\s*stop\s*$", re.IGNORECASE)
+_WATCH_RE = re.compile(r"^\s*watch\s+(\d+)\s+(\d+)\s+([\d.]+)\s+(\d+)\s*$", re.IGNORECASE)
+_WATCH_OPEN_RE = re.compile(
+    r"^\s*watch-open\s+(買い|買|buy)\s+(\d+)\s+(\d+)\s+([\d.]+)\s*$", re.IGNORECASE)
+_UNWATCH_RE = re.compile(r"^\s*unwatch\s+(\d+)\s*$", re.IGNORECASE)
+_UNWATCH_OPEN_RE = re.compile(r"^\s*unwatch-open\s+(\d+)\s*$", re.IGNORECASE)
 USAGE = (
-    "書式が正しくありません。例: `buy 3930 200 742`（buy/sell 銘柄コード 株数 価格）、"
-    "`start 3930 1000 760`（銘柄・合計株数・上限価格を指定してリビッド開始）、"
-    "`stop`（リビッド停止）、"
-    "`clear all`（未約定注文を全取消）、`book`（板情報を投稿。`book 3930` で銘柄指定も可）"
+    "書式が正しくありません。\n"
+    "• `buy 3930 300 744` / `sell 3930 300 744` … 一回きりの指値注文（銘柄 株数 価格）\n"
+    "• `watch 3930 400 760 900` … 銘柄・平均株数(±30%)・上限価格・平均間隔秒(±30%)で"
+    "rebid（その銘柄の未約定注文を取消して最良買気配に買い指値）を続ける。`unwatch 3930` で解除\n"
+    "• `watch-open buy 3930 400 760` … 毎営業日8:59〜9:05に20秒毎のrebid。"
+    "`unwatch-open 3930` で解除\n"
+    "• `clear-all` … 未約定注文を全取消\n"
+    "• `book` / `book 3930` … 板情報を投稿"
 )
 
 
@@ -89,21 +97,45 @@ def is_clear_all(text, bot_user_id):
     return bool(_CLEAR_ALL_RE.match(_strip_mention(text, bot_user_id)))
 
 
-def parse_start(text, bot_user_id):
-    """`start 3930 1000 760`（銘柄 合計株数 上限価格）を解析する。合わなければ None。"""
-    m = _START_RE.match(_strip_mention(text, bot_user_id))
+def parse_watch(text, bot_user_id):
+    """`watch 3930 400 760 900`（銘柄 平均株数 上限価格 平均間隔秒）を解析する。"""
+    m = _WATCH_RE.match(_strip_mention(text, bot_user_id))
     if not m:
         return None
     return {
         "ticker": m.group(1),
-        "target_qty": int(m.group(2)),
+        "avg_qty": int(m.group(2)),
         "price_cap": float(m.group(3)),
+        "avg_interval_sec": int(m.group(4)),
     }
 
 
-def is_stop(text, bot_user_id):
-    """`stop` という厳密な文字列（大文字小文字は無視）かどうか。"""
-    return bool(_STOP_RE.match(_strip_mention(text, bot_user_id)))
+def parse_watch_open(text, bot_user_id):
+    """`watch-open buy 3930 400 760`（buy 銘柄 株数 上限価格）を解析する。
+
+    rebid は「買い板の一番上に買いを入れる」動作なので side は buy のみ受ける。
+    """
+    m = _WATCH_OPEN_RE.match(_strip_mention(text, bot_user_id))
+    if not m:
+        return None
+    return {
+        "side": "buy",
+        "ticker": m.group(2),
+        "qty": int(m.group(3)),
+        "price_cap": float(m.group(4)),
+    }
+
+
+def parse_unwatch(text, bot_user_id):
+    """`unwatch 3930` を解析して銘柄コードを返す。合わなければ None。"""
+    m = _UNWATCH_RE.match(_strip_mention(text, bot_user_id))
+    return m.group(1) if m else None
+
+
+def parse_unwatch_open(text, bot_user_id):
+    """`unwatch-open 3930` を解析して銘柄コードを返す。合わなければ None。"""
+    m = _UNWATCH_OPEN_RE.match(_strip_mention(text, bot_user_id))
+    return m.group(1) if m else None
 
 
 def parse_book(text, bot_user_id):
@@ -147,18 +179,19 @@ def _react_async(channel, ts):
     threading.Thread(target=_run, daemon=True).start()
 
 
-def handle_event(headers, raw_body, bot_user_id, on_command, on_clear_all, on_book,
-                 on_start, on_stop):
+def handle_event(headers, raw_body, bot_user_id, handlers):
     """`/slack/events` へのPOSTを処理する。(status_code, response_body_bytes) を返す。
 
-    on_command(parsed, channel, thread_ts, reply) は、書式・権限チェックを通った
-    発注コマンドについて呼ばれる。on_clear_all(channel, thread_ts, reply) は
-    `clear all` コマンドについて、on_book(ticker, channel, thread_ts, reply) は
-    `book`/`book 3930` コマンドについて呼ばれる（tickerは未指定ならNone）。
-    on_start(parsed, channel, thread_ts, reply) は `start 銘柄 合計株数 上限価格`、
-    on_stop(channel, thread_ts, reply) は `stop` について呼ばれる。
+    handlers はコマンド名 → コールバックの辞書:
+      order(parsed, channel, thread_ts, reply)        … buy/sell（一回きりの注文）
+      clear_all(channel, thread_ts, reply)            … clear-all
+      book(ticker, channel, thread_ts, reply)         … book（tickerは未指定ならNone）
+      watch(parsed, channel, thread_ts, reply)        … watch
+      watch_open(parsed, channel, thread_ts, reply)   … watch-open
+      unwatch(ticker, channel, thread_ts, reply)      … unwatch
+      unwatch_open(ticker, channel, thread_ts, reply) … unwatch-open
     reply(text) はそのスレッドに返信する関数。Slackの3秒タイムアウトに収まるよう、
-    いずれも重い処理をせずキューに積むだけにすること。
+    いずれも重い処理をせずキュー/設定ファイルの操作だけにすること。
     """
     if not verify_signature(headers, raw_body):
         return 401, b"invalid signature"
@@ -200,26 +233,37 @@ def handle_event(headers, raw_body, bot_user_id, on_command, on_clear_all, on_bo
 
     text = event.get("text", "")
     if is_clear_all(text, bot_user_id):
-        on_clear_all(channel, thread_ts, reply)
+        handlers["clear_all"](channel, thread_ts, reply)
         return 200, b"ok"
 
-    started = parse_start(text, bot_user_id)
-    if started is not None:
-        on_start(started, channel, thread_ts, reply)
+    watch = parse_watch(text, bot_user_id)
+    if watch is not None:
+        handlers["watch"](watch, channel, thread_ts, reply)
         return 200, b"ok"
 
-    if is_stop(text, bot_user_id):
-        on_stop(channel, thread_ts, reply)
+    watch_open = parse_watch_open(text, bot_user_id)
+    if watch_open is not None:
+        handlers["watch_open"](watch_open, channel, thread_ts, reply)
+        return 200, b"ok"
+
+    unwatch = parse_unwatch(text, bot_user_id)
+    if unwatch is not None:
+        handlers["unwatch"](unwatch, channel, thread_ts, reply)
+        return 200, b"ok"
+
+    unwatch_open = parse_unwatch_open(text, bot_user_id)
+    if unwatch_open is not None:
+        handlers["unwatch_open"](unwatch_open, channel, thread_ts, reply)
         return 200, b"ok"
 
     book = parse_book(text, bot_user_id)
     if book is not None:
-        on_book(book["ticker"], channel, thread_ts, reply)
+        handlers["book"](book["ticker"], channel, thread_ts, reply)
         return 200, b"ok"
 
     parsed = parse_command(text, bot_user_id)
     if not parsed:
         reply(USAGE)
         return 200, b"ok"
-    on_command(parsed, channel, thread_ts, reply)
+    handlers["order"](parsed, channel, thread_ts, reply)
     return 200, b"ok"

@@ -28,6 +28,11 @@ def _conn():
         " filled_at TEXT,"
         " notified_at TEXT"
         ")")
+    # 部分約定した株数（注文照会の約定明細から反映）。旧DBには無いので後付けする。
+    try:
+        conn.execute("ALTER TABLE orders ADD COLUMN filled_qty INTEGER")
+    except sqlite3.OperationalError:
+        pass  # 追加済み
     if not existed:
         os.chmod(DB_PATH, 0o600)
     return conn
@@ -70,6 +75,29 @@ def pending_watch_orders():
         rows = conn.execute(
             "SELECT * FROM orders WHERE status = 'submitted'").fetchall()
         return [dict(r) for r in rows]
+
+
+def filled_qty_since(ticker, side, since_iso):
+    """since_iso（UTC ISO）以降に発注した注文の約定株数合計。
+
+    filled_qty（部分約定含む実測）があればそれを、無ければ全部約定した注文の
+    qty を数える。買付サマリ表示用で、発注判断には使わない。
+    """
+    with _conn() as conn:
+        row = conn.execute(
+            "SELECT SUM(COALESCE(filled_qty,"
+            "  CASE WHEN status = 'filled' THEN qty ELSE 0 END)) AS total"
+            " FROM orders WHERE ticker = ? AND side = ? AND created_at >= ?",
+            (str(ticker), side, since_iso)).fetchone()
+        return row["total"] or 0
+
+
+def get_order_by_sbi_id(sbi_order_id):
+    with _conn() as conn:
+        row = conn.execute(
+            "SELECT * FROM orders WHERE sbi_order_id = ? ORDER BY id DESC LIMIT 1",
+            (str(sbi_order_id),)).fetchone()
+        return dict(row) if row else None
 
 
 def update_order_by_sbi_id(sbi_order_id, **fields):
