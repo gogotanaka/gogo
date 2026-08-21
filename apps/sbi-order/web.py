@@ -33,7 +33,8 @@ PORT = 8381
 _BOT_USER_ID = None  # main()で解決。メンション本文から自分宛の<@ID>を取り除くのに使う。
 POLL_INTERVAL_SEC = 60
 # 板情報の定期投稿: 相場が開く日の8:00から、時計に揃えた固定間隔（既定10分毎:
-# 8:00, 8:10, ...）で SLACK_MENTION_USER 宛メンション付きで投稿する。
+# 8:00, 8:10, ...）で投稿する（メンションは付けない。付けるのは要対応・
+# 流動性アラート等、人の注意が要る通知だけ）。
 PRICE_POST_INTERVAL_SEC = int(ENV.get("SBI_PRICE_POST_INTERVAL_SEC", "600"))
 WATCH_TICKERS = [t.strip() for t in ENV.get("SBI_WATCH_TICKERS", "").split(",") if t.strip()]
 SLACK_CHANNEL = ENV.get("SLACK_CHANNEL", "")
@@ -54,6 +55,12 @@ WATCH_OPEN_INTERVAL_SEC = int(ENV.get("SBI_WATCH_OPEN_INTERVAL_SEC", "20"))
 # 見られるようになる。未設定ならトンネル経由は従来どおり全て404。
 # 発注フォーム（/orders）はどちらにせよローカル限定。
 UI_PASSWORD = ENV.get("SBI_UI_PASSWORD", "")
+
+# 売り板の流動性アラート: 最良売気配から +RANGE 円以内の売り数量の合計が
+# 「watchの平均株数 × MULT」以上になったらメンションで知らせる
+# （まとまった株数を厚い売り板で一気に取れるタイミングの検知）。
+LIQ_ALERT_MULT = float(ENV.get("SBI_LIQ_ALERT_MULT", "5"))
+LIQ_ALERT_RANGE_YEN = float(ENV.get("SBI_LIQ_ALERT_RANGE_YEN", "5"))
 
 JST = timezone(timedelta(hours=9))
 
@@ -87,6 +94,8 @@ _login_backoff_until = 0.0
 # 銘柄ごとの価格上限超え通知フラグ。超えている間の連投を防ぎ、上限以下に
 # 戻ったらリセットして次の超過時にまた1回だけ知らせる（_sbi_loopスレッドのみが書く）。
 _cap_alerted = {}
+# 銘柄ごとの流動性アラート通知フラグ。条件を満たしている間の連投を防ぐ（同上）。
+_liq_alerted = {}
 # web UI 表示用のスナップショット（ticker -> 直近の気配・アクション等）。
 # _sbi_loop が書き、HTTPスレッドは読むだけ。
 _loop_state = {}
@@ -510,36 +519,43 @@ def _resend_unnotified_fills():
 
 
 def _poll_price(client):
-    mention = f"<@{SLACK_MENTION_USER}> " if SLACK_MENTION_USER else ""
     try:
         client.ensure_logged_in()
         _clear_login_alert()
         for ticker in WATCH_TICKERS:
             book = client.get_order_book(ticker)
-            slack_client.post(SLACK_CHANNEL, mention + format_order_book(ticker, book))
+            slack_client.post(SLACK_CHANNEL, format_order_book(ticker, book))
             print(f"[price] {ticker} の板を投稿しました", file=sys.stderr)
+            # watch対象銘柄なら、せっかく読んだ板で流動性アラートも判定する
+            # （ティックの15分間隔より細かい10分間隔で検知できる）
+            w = watch_store.get_watch(ticker)
+            if w:
+                _check_ask_liquidity(ticker, w["avg_qty"], book)
     except HumanInterventionRequired as e:
         _alert_login_needed(str(e))
     except Exception as e:
         print(f"[price] 板情報取得に失敗しました: {e}", file=sys.stderr)
 
 
-def _watch_report(text):
-    mention = f"<@{SLACK_MENTION_USER}> " if SLACK_MENTION_USER else ""
+def _watch_report(text, mention=False):
+    """watch系の通知。定常レポート（rebid結果等）はメンション無し、
+    人の注意が要るもの（要対応・失敗・上限超え・流動性アラート等）だけ
+    mention=True でメンションを付ける。"""
+    prefix = f"<@{SLACK_MENTION_USER}> " if mention and SLACK_MENTION_USER else ""
     print(f"[watch] {text}", file=sys.stderr)
     notify.notify("SBI watch", text)
     if SLACK_CHANNEL:
         try:
-            slack_client.post(SLACK_CHANNEL, f"{mention}{text}")
+            slack_client.post(SLACK_CHANNEL, f"{prefix}{text}")
         except Exception as e:
             print(f"[watch] Slack投稿に失敗しました: {e}", file=sys.stderr)
 
 
-def _best_numeric_bid(client, ticker):
-    """最良買気配の価格を float で返す。板は価格の降順なので、価格が数値で
-    買数量がある最初の行が最良買気配。OVER/UNDER/成行の行は指値に使えないので
-    飛ばす。読めなければ None。"""
-    for row in client.get_order_book(ticker)["rows"]:
+def _best_bid_from_book(book):
+    """板から最良買気配の価格を float で返す。板は価格の降順なので、価格が
+    数値で買数量がある最初の行が最良買気配。OVER/UNDER/成行の行は指値に
+    使えないので飛ばす。読めなければ None。"""
+    for row in book["rows"]:
         if not row["bid_qty"]:
             continue
         try:
@@ -548,6 +564,42 @@ def _best_numeric_bid(client, ticker):
         except ValueError:
             continue
     return None
+
+
+def _check_ask_liquidity(ticker, base_qty, book):
+    """売り板の流動性アラート。
+
+    最良売気配（売り板の一番下 = 数値価格の最安の売り行）から
+    +LIQ_ALERT_RANGE_YEN 円以内にある売り数量の合計が
+    base_qty（watchの平均株数）× LIQ_ALERT_MULT 以上なら、メンションで
+    1回だけ知らせる（条件を満たしている間は繰り返さず、外れたらリセット）。
+    """
+    need = int(base_qty * LIQ_ALERT_MULT)
+    asks = []
+    for row in book["rows"]:
+        if not row["ask_qty"]:
+            continue
+        try:
+            asks.append((float(row["price"].replace(",", "")), row["ask_qty"]))
+        except ValueError:
+            continue
+    if not asks:
+        _liq_alerted[ticker] = False
+        return
+    best_ask = min(p for p, _ in asks)
+    total = sum(q for p, q in asks if p <= best_ask + LIQ_ALERT_RANGE_YEN)
+    if total >= need:
+        if not _liq_alerted.get(ticker):
+            _liq_alerted[ticker] = True
+            _watch_report(
+                f"{ticker}: 売り板が厚くなっています — 最良売気配{best_ask:,.0f}円"
+                f"から+{LIQ_ALERT_RANGE_YEN:,.0f}円以内に合計{total:,}株。"
+                f"watch平均{base_qty}株の{LIQ_ALERT_MULT:,.0f}倍"
+                f"（{need:,}株）を一気に買える板です"
+                f"（この通知は条件を満たしている間は繰り返しません）",
+                mention=True)
+    else:
+        _liq_alerted[ticker] = False
 
 
 def _jitter(avg):
@@ -587,7 +639,7 @@ def _cancel_with_terminal_check(client, sbi_order_id):
 
 
 def _rebid_tick(client, ticker, qty_target, price_cap, tag, still_valid,
-                skip_if_at_bid=False):
+                skip_if_at_bid=False, liquidity_qty=None):
     """1回の rebid: 最良買気配の確認 → 上限判定 → その銘柄の未約定注文を取消 →
     株数を売買単位に丸めて買い指値。
 
@@ -603,11 +655,16 @@ def _rebid_tick(client, ticker, qty_target, price_cap, tag, still_valid,
         _clear_login_alert()
         state.pop("last_error", None)  # ログインが通ったら「要対応」連投抑止を解除
 
-        bid = _best_numeric_bid(client, ticker)
+        book = client.get_order_book(ticker)
+        bid = _best_bid_from_book(book)
+        if liquidity_qty:
+            _check_ask_liquidity(ticker, liquidity_qty, book)
         state["last_check"] = datetime.now(JST).strftime("%m/%d %H:%M:%S")
         state["last_bid"] = bid
         if bid is None:
-            _watch_report(f"{tag}: {ticker} の最良買気配が取れなかったため見送りました")
+            _watch_report(
+                f"{tag}: {ticker} の最良買気配が取れなかったため見送りました",
+                mention=True)
             state["last_action"] = "気配が読めず見送り"
             return
         cap_key = f"{tag}:{ticker}"  # watchとwatch-openで上限が違いうるので別々に管理
@@ -617,7 +674,7 @@ def _rebid_tick(client, ticker, qty_target, price_cap, tag, still_valid,
                 _watch_report(
                     f"{tag}: {ticker} の最良買気配が上限({price_cap:,.0f}円)を"
                     f"超えました（現在 {bid}円）。上限以下に戻るまで発注を見送ります"
-                    f"（この通知は繰り返しません）")
+                    f"（この通知は繰り返しません）", mention=True)
             state["last_action"] = f"上限超え（気配 {bid}円 > {price_cap:,.0f}円）で見送り"
             return
         _cap_alerted[cap_key] = False
@@ -630,7 +687,7 @@ def _rebid_tick(client, ticker, qty_target, price_cap, tag, still_valid,
             # unknown化してpending_watch_ordersが空になり、ガードが死ぬ）
             _watch_report(
                 f"{tag}: {ticker} の注文照会が空でした（追跡中の注文があるため"
-                f"読み取り異常の疑い）。今回の発注は見送ります")
+                f"読み取り異常の疑い）。今回の発注は見送ります", mention=True)
             state["last_action"] = "照会が読めず見送り"
             return
         _sync_orders_from_rows(rows)
@@ -674,7 +731,7 @@ def _rebid_tick(client, ticker, qty_target, price_cap, tag, still_valid,
             _watch_report(
                 f"{tag}: {cancelled_note}最小数量({REBID_LOT_SIZE}株)でも見積が"
                 f"上限({MAX_ORDER_VALUE_YEN:,.0f}円)を超えるため見送りました"
-                f"（最良買気配 {bid}円）")
+                f"（最良買気配 {bid}円）", mention=True)
             state["last_action"] = "金額上限超えで見送り"
             return
 
@@ -693,12 +750,12 @@ def _rebid_tick(client, ticker, qty_target, price_cap, tag, still_valid,
                 _watch_report(
                     f"{tag}: {cancelled_note}発注の受付確認に失敗しましたが、"
                     f"注文照会で確認できたため追跡します: {ticker} 買 {qty}株"
-                    f" @ {bid}円 (注文番号{adopted})")
+                    f" @ {bid}円 (注文番号{adopted})", mention=True)
                 state["last_action"] = f"買 {qty}株 @ {bid}円 (注文番号{adopted}, 突合で確認)"
             else:
                 _watch_report(
                     f"{tag}: {cancelled_note}発注に失敗しました（受注済みの可能性も"
-                    f"あるため注文照会を確認してください）: {e}")
+                    f"あるため注文照会を確認してください）: {e}", mention=True)
                 state["last_action"] = f"発注失敗: {e}"
             return
         order_store.update_order(
@@ -715,7 +772,7 @@ def _rebid_tick(client, ticker, qty_target, price_cap, tag, still_valid,
         # ログアウトが続く間、毎ティック同じ「要対応」をメンションで連投しない
         if state.get("last_error") != str(e):
             state["last_error"] = str(e)
-            _watch_report(f"{tag}: 実行できませんでした（要対応）: {e}")
+            _watch_report(f"{tag}: 実行できませんでした（要対応）: {e}", mention=True)
         else:
             print(f"[watch] {tag}: 要対応が継続中: {e}", file=sys.stderr)
         state["last_action"] = f"要対応: {e}"
@@ -724,7 +781,7 @@ def _rebid_tick(client, ticker, qty_target, price_cap, tag, still_valid,
         # watch-open窓(20秒毎)で同じ失敗が続いたときの連投を防ぐ
         if state.get("last_error") != str(e):
             state["last_error"] = str(e)
-            _watch_report(f"{tag}: 実行に失敗しました: {e}")
+            _watch_report(f"{tag}: 実行に失敗しました: {e}", mention=True)
         else:
             print(f"[watch] {tag}: 失敗が継続中: {e}", file=sys.stderr)
         state["last_action"] = f"失敗: {e}"
@@ -780,7 +837,7 @@ def _sbi_loop():
         # 「受け付けました」と返信済みの注文が静かに消えないよう知らせる
         _watch_report(
             f"再起動により、受付済みで未発注の注文 {len(abandoned)}件を"
-            f"取りやめました（発注されていません）: {detail}")
+            f"取りやめました（発注されていません）: {detail}", mention=True)
 
     client = _connect_with_retry()
     try:
@@ -899,7 +956,8 @@ def _sbi_loop():
                         client, ticker, _jitter(w["avg_qty"]), w["price_cap"],
                         "watch",
                         still_valid=lambda t=ticker, w0=w:
-                            watch_store.get_watch(t) == w0)
+                            watch_store.get_watch(t) == w0,
+                        liquidity_qty=w["avg_qty"])
                     next_watch_tick[ticker] = time.monotonic() + max(
                         WATCH_MIN_INTERVAL_SEC, _jitter(w["avg_interval_sec"]))
         except Exception as e:
