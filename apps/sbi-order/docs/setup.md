@@ -60,6 +60,11 @@ SBI_MAX_ORDER_VALUE_YEN=500000      # メンション発注・リビッドの上
 # watch / watch-open（設定自体はSlackメンションで行う。envは調整のみ）
 SBI_REBID_LOT_SIZE=100              # 売買単位（株）。株数の丸めに使う。既定100
 SBI_WATCH_OPEN_INTERVAL_SEC=20      # watch-openのrebid間隔（秒）。既定20
+
+SBI_UI_PASSWORD=強いランダム文字列   # 設定すると、公開トンネル経由でもダッシュボード
+                                     # （閲覧のみ）をBasic認証で見られる（ユーザー名は任意、
+                                     # パスワードのみ照合）。発注フォームはローカル限定のまま。
+                                     # 未設定ならトンネル経由のUIは従来どおり全て404
 ```
 
 Slack bot トークンも別ファイルで置く（上記チャンネルに招待済みであること）:

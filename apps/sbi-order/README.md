@@ -5,7 +5,9 @@ Slack botにメンションで指示すると、SBI証券のWebサイトをブ�
 
 - セットアップ・運用・構成: [docs/setup.md](docs/setup.md)
 - 設計判断の経緯・リスク・実画面の知見: [docs/adr/](docs/adr/)
-- 今の watch 状況・注文履歴・手動発注: http://localhost:8381 （ローカルweb UI）
+- 今の watch 状況・注文履歴・手動発注: http://localhost:8381 （ローカルweb UI）。
+  `SBI_UI_PASSWORD` を設定すれば https://sbi-order.awsm.jp からも**閲覧のみ**
+  Basic認証で見られる（発注はローカルかSlackのみ）
 
 ## 言語
 

@@ -8,6 +8,8 @@ watch系は「その銘柄の未約定注文を取消して最良買気配に買
 Usage: python3 web.py
 初回は config/.env が必要（docs/setup.md のセットアップ手順を参照）。
 """
+import base64
+import hmac
 import html
 import queue
 import random
@@ -47,6 +49,11 @@ WATCH_MIN_INTERVAL_SEC = 60
 WATCH_OPEN_START = dt_time(8, 59)
 WATCH_OPEN_END = dt_time(9, 5, 59)
 WATCH_OPEN_INTERVAL_SEC = int(ENV.get("SBI_WATCH_OPEN_INTERVAL_SEC", "20"))
+
+# 設定すると、公開トンネル経由でもダッシュボード（閲覧のみ）をBasic認証で
+# 見られるようになる。未設定ならトンネル経由は従来どおり全て404。
+# 発注フォーム（/orders）はどちらにせよローカル限定。
+UI_PASSWORD = ENV.get("SBI_UI_PASSWORD", "")
 
 JST = timezone(timedelta(hours=9))
 
@@ -901,7 +908,7 @@ def _sbi_loop():
 
 # --- HTML ---
 
-def _render(orders, message=""):
+def _render(orders, message="", readonly=False):
     data = watch_store.load()
     today_start = _today_jst_start_utc()
 
@@ -948,6 +955,19 @@ def _render(orders, message=""):
         for o in orders
     )
     msg_html = f'<p class="msg">{html.escape(message)}</p>' if message else ""
+    if readonly:
+        # リモート閲覧では発注フォームを出さない（POST /orders もローカル限定）
+        order_form = ('<p class="note">リモート閲覧のため手動発注は無効です。'
+                      '発注はSlackメンション（buy/sell）で。</p>')
+    else:
+        order_form = """<h2>手動発注</h2>
+<form method="post" action="/orders">
+  <input name="ticker" placeholder="銘柄コード" required>
+  <select name="side"><option value="buy">買</option><option value="sell">売</option></select>
+  <input name="qty" type="number" placeholder="株数" required>
+  <input name="price" type="number" step="0.1" placeholder="指値価格" required>
+  <button type="submit">発注</button>
+</form>"""
     return f"""<!doctype html><html lang="ja"><head><meta charset="utf-8">
 <meta http-equiv="refresh" content="30">
 <title>SBI 発注 / watch状況</title>
@@ -975,14 +995,7 @@ h2{{margin:1.5rem 0 0}}
 <tr><th>銘柄</th><th>株数</th><th>上限価格</th><th>実行タイミング</th><th>直近アクション</th></tr>
 {open_rows}
 </table>
-<h2>手動発注</h2>
-<form method="post" action="/orders">
-  <input name="ticker" placeholder="銘柄コード" required>
-  <select name="side"><option value="buy">買</option><option value="sell">売</option></select>
-  <input name="qty" type="number" placeholder="株数" required>
-  <input name="price" type="number" step="0.1" placeholder="指値価格" required>
-  <button type="submit">発注</button>
-</form>
+{order_form}
 <h2>注文履歴</h2>
 <table>
 <tr><th>ID</th><th>銘柄</th><th>売買</th><th>株数</th><th>価格</th><th>状態</th><th>約定株数</th><th>エラー</th></tr>
@@ -1006,12 +1019,43 @@ class Handler(BaseHTTPRequestHandler):
         host = (self.headers.get("Host") or "").split(":")[0]
         return host in ("localhost", "127.0.0.1")
 
+    def _remote_view_authorized(self):
+        """トンネル経由の閲覧をBasic認証で許可するか。
+
+        パスワード未設定なら常に不許可（トンネル経由は404のまま）。
+        比較はタイミング攻撃を避けて hmac.compare_digest で行う。
+        """
+        if not UI_PASSWORD:
+            return False
+        auth = self.headers.get("Authorization", "")
+        if not auth.startswith("Basic "):
+            return False
+        try:
+            decoded = base64.b64decode(auth[6:]).decode("utf-8")
+            _, _, password = decoded.partition(":")
+        except Exception:
+            return False
+        return hmac.compare_digest(password, UI_PASSWORD)
+
     def do_GET(self):
-        if self.path != "/" or not self._is_local_request():
+        if self.path != "/":
             self.send_response(404)
             self.end_headers()
             return
-        self._respond(200, _render(order_store.list_orders()))
+        if self._is_local_request():
+            self._respond(200, _render(order_store.list_orders()))
+            return
+        if not UI_PASSWORD:
+            self.send_response(404)
+            self.end_headers()
+            return
+        if not self._remote_view_authorized():
+            self.send_response(401)
+            self.send_header("WWW-Authenticate", 'Basic realm="sbi-order"')
+            self.end_headers()
+            return
+        # リモートは閲覧のみ（発注フォームは表示せず、POST /orders も受けない）
+        self._respond(200, _render(order_store.list_orders(), readonly=True))
 
     def do_POST(self):
         if self.path == "/slack/events":
