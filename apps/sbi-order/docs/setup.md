@@ -61,6 +61,10 @@ SBI_MAX_ORDER_VALUE_YEN=500000      # メンション発注・リビッドの上
 SBI_REBID_LOT_SIZE=100              # 売買単位（株）。株数の丸めに使う。既定100
 SBI_WATCH_OPEN_INTERVAL_SEC=20      # watch-openのrebid間隔（秒）。既定20
 
+# 流動性アラート（watch対象銘柄のみ。板の定期取得・rebidティックの際に判定）
+SBI_LIQ_ALERT_MULT=5                # watch平均株数の何倍を「一気に買える」とみなすか。既定5
+SBI_LIQ_ALERT_RANGE_YEN=5           # 最良売気配から何円以内の売り数量を合計するか。既定5
+
 SBI_UI_PASSWORD=強いランダム文字列   # 設定すると、公開トンネル経由でもダッシュボード
                                      # （閲覧のみ）をBasic認証で見られる（ユーザー名は任意、
                                      # パスワードのみ照合）。発注フォームはローカル限定のまま。
@@ -159,7 +163,8 @@ different threadで壊れる）ため、発注処理・約定確認・株価取�
 
 `SBI_WATCH_TICKERS` を設定していれば、相場が開く日の8:00から `SBI_PRICE_POST_INTERVAL_SEC`
 （既定600秒 = 10分毎、時計に揃えて 8:00, 8:10, ...）間隔で対象銘柄の板情報（気配値）を取得し、
-`SLACK_CHANNEL` に `SLACK_MENTION_USER` 宛メンション付きで投稿し続ける。
+`SLACK_CHANNEL` に投稿し続ける（メンションは付けない）。板を読んだついでに、
+watch対象銘柄には流動性アラートの判定も行う。
 
 ## 構成
 
