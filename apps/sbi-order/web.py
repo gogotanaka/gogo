@@ -50,6 +50,9 @@ WATCH_MIN_INTERVAL_SEC = 60
 WATCH_OPEN_START = dt_time(8, 59)
 WATCH_OPEN_END = dt_time(9, 5, 59)
 WATCH_OPEN_INTERVAL_SEC = int(ENV.get("SBI_WATCH_OPEN_INTERVAL_SEC", "20"))
+# watchティックは数十秒かかるため、この時刻以降はwatch-open対象銘柄のwatchを
+# 止めて、8:59:00のwatch-open初回ティックが遅れないようにする
+WATCH_OPEN_GUARD_START = dt_time(8, 57)
 
 # 設定すると、公開トンネル経由でもダッシュボード（閲覧のみ）をBasic認証で
 # 見られるようになる。未設定ならトンネル経由は従来どおり全て404。
@@ -301,9 +304,8 @@ def _on_watch(parsed, channel, thread_ts, reply):
         parsed["ticker"], parsed["avg_qty"], parsed["price_cap"],
         parsed["avg_interval_sec"])
     suppressed_note = (
-        f"\n※この銘柄にはwatch-openが設定されています。watch-openがある間は"
-        f"watch-openだけが実行され、このwatchは休止します"
-        f"（`unwatch-open {parsed['ticker']}` で再開）。"
+        f"\n※この銘柄にはwatch-openが設定されています。8:57〜9:05（寄り付きの窓）"
+        f"の間だけwatch-openが優先し、このwatchは休止します（窓が終われば再開）。"
         if watch_store.get_watch_open(parsed["ticker"]) else "")
     reply(
         f"watch設定{'（置き換え）' if prev else ''}: {parsed['ticker']} を"
@@ -332,8 +334,8 @@ def _on_watch_open(parsed, channel, thread_ts, reply):
     prev = watch_store.set_watch_open(
         parsed["ticker"], parsed["side"], parsed["qty"], parsed["price_cap"])
     suppressed_note = (
-        f"\n※この銘柄のwatchは、watch-openがある間は休止します"
-        f"（watch-openだけが実行されます）。"
+        f"\n※この銘柄のwatchは8:57〜9:05（寄り付きの窓）の間だけ休止し、"
+        f"窓が終われば通常どおり実行されます。"
         if watch_store.get_watch(parsed["ticker"]) else "")
     reply(
         f"watch-open設定{'（置き換え）' if prev else ''}: {parsed['ticker']} を"
@@ -361,7 +363,7 @@ def _on_unwatch_open(ticker, channel, thread_ts, reply):
         reply(f"{ticker} のwatch-openは設定されていません。")
         return
     resume_note = (
-        f" この銘柄のwatchが再開します（場中なら即時）。"
+        f" この銘柄のwatchは引き続き全時間帯で動きます。"
         if watch_store.get_watch(ticker) else "")
     reply(f"{ticker} のwatch-openを解除しました。{resume_note}")
 
@@ -911,6 +913,12 @@ def _sbi_loop():
                 and WATCH_OPEN_START <= now_jst.time() <= WATCH_OPEN_END)
             open_tick_due = in_open_window and any(
                 now >= next_open_tick.get(t, 0) for t in data["watch_opens"])
+            # watch-open対象銘柄のwatchを止めるのはこの時間帯だけ
+            # （8:57〜9:05。窓が終わればwatchが再開し、watch-openの残注文も
+            # 次のwatchティックが通常どおり取消して置き直す）
+            near_open_window = (
+                now_jst.weekday() < 5
+                and WATCH_OPEN_GUARD_START <= now_jst.time() <= WATCH_OPEN_END)
 
             if now >= next_order_poll:
                 _poll_orders(client)
@@ -940,9 +948,9 @@ def _sbi_loop():
 
             if _is_market_hours(now_jst):
                 for ticker, w in data["watches"].items():
-                    if ticker in data["watch_opens"]:
-                        # 同一銘柄に watch-open がある間は watch-open だけを実行する
-                        # （watch は設定を残したまま休止。unwatch-open で再開）
+                    if near_open_window and ticker in data["watch_opens"]:
+                        # 寄り付きの窓（直前2分含む）だけ watch-open に譲る。
+                        # 窓が終わればwatchが通常どおり実行される
                         continue
                     if seen_watch_updated.get(ticker) != w["updated_at"]:
                         # 新規設定・置き換えは即時に初回ティック。
@@ -975,8 +983,11 @@ def _render(orders, message="", readonly=False):
         st = _loop_state.get(ticker, {})
         bought = order_store.filled_qty_since(ticker, "buy", today_start)
         last_bid = st.get("last_bid")
-        suppressed = ticker in data["watch_opens"]
-        action = ("watch-open優先のため休止中（unwatch-openで再開）"
+        now_t = datetime.now(JST)
+        suppressed = (ticker in data["watch_opens"]
+                      and now_t.weekday() < 5
+                      and WATCH_OPEN_GUARD_START <= now_t.time() <= WATCH_OPEN_END)
+        action = ("watch-open優先のため休止中（8:57〜9:05のみ）"
                   if suppressed else str(st.get("last_action") or "—"))
         watch_rows += (
             f"<tr><td>{html.escape(ticker)}</td>"
