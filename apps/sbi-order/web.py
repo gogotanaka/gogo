@@ -641,15 +641,16 @@ def _cancel_with_terminal_check(client, sbi_order_id):
 
 
 def _rebid_tick(client, ticker, qty_target, price_cap, tag, still_valid,
-                skip_if_at_bid=False, liquidity_qty=None):
+                liquidity_qty=None):
     """1回の rebid: 最良買気配の確認 → 上限判定 → その銘柄の未約定注文を取消 →
     株数を売買単位に丸めて買い指値。
 
+    ただし、自分の注文が既に最良買気配と同値で並んでいる（買い板の一番上が
+    自分）なら何もしない（取消→再発注は板の待ち順を失うだけ。ユーザー指定の
+    仕様、2026-08-24）。
     still_valid() は発注直前に呼ばれ、False なら発注せず中断する（ティック中に
     unwatch や設定の置き換えが入った場合の安全弁。板取得や取消は数十秒かかるため
     HTTPスレッドの設定変更と重なりうる）。
-    skip_if_at_bid は watch-open（20秒毎）用: 自分の注文が既に最良買気配と同値で
-    並んでいるなら何もしない（取消→再発注は板の順番を失うだけ）。
     """
     state = _loop_state.setdefault(ticker, {})
     try:
@@ -697,11 +698,11 @@ def _rebid_tick(client, ticker, qty_target, price_cap, tag, still_valid,
         pending = [r for r in rows
                    if "注文中" in r["status"] and r.get("ticker") == ticker]
 
-        if skip_if_at_bid and pending:
+        if pending:
             own = [order_store.get_order_by_sbi_id(r["order_id"]) for r in pending]
             if all(o and o["side"] == "buy" and o["price"] == bid for o in own):
-                state["last_action"] = f"既に最良買気配({bid}円)に注文あり（{tag}）"
-                return  # 取消→再発注しても板の順番を失うだけなので何もしない
+                state["last_action"] = f"既に最良買気配({bid}円)に自分の注文あり（{tag}）"
+                return  # 取消→再発注しても板の待ち順を失うだけなので何もしない
 
         cancelled = []
         for r in pending:
@@ -942,8 +943,7 @@ def _sbi_loop():
                     _rebid_tick(
                         client, ticker, wo["qty"], wo["price_cap"], "watch-open",
                         still_valid=lambda t=ticker, w=wo:
-                            watch_store.get_watch_open(t) == w,
-                        skip_if_at_bid=True)
+                            watch_store.get_watch_open(t) == w)
                     next_open_tick[ticker] = time.monotonic() + WATCH_OPEN_INTERVAL_SEC
 
             if _is_market_hours(now_jst):
