@@ -1,0 +1,17 @@
+{
+  "name": "zozo-sales-notify",
+  "main": "src/index.ts",
+  "compatibility_date": "2025-01-01",
+  "account_id": "06ebf33d14a637ea43e93d48b57260e4",
+
+  "triggers": {
+    "crons": ["0 * * * *"]
+  },
+
+  "kv_namespaces": [
+    {
+      "binding": "ZOZO_STATE",
+      "id": "4b41091abb9445f18090b0b9e794e11c"
+    }
+  ]
+}
